@@ -24,6 +24,9 @@
 #endif
 #include "clocale"
 #include "cstring"
+#if defined(_LIBCPP_MSVCRT)
+#define _CTYPE_DISABLE_MACROS
+#endif
 #include "cwctype"
 #include "__sso_allocator"
 #if defined(_LIBCPP_MSVCRT) || defined(__MINGW32__)
@@ -141,7 +144,7 @@ class _LIBCPP_HIDDEN locale::__imp
     : public facet
 {
     enum {N = 28};
-#if defined(_LIBCPP_MSVC)
+#if defined(_LIBCPP_COMPILER_MSVC)
 // FIXME: MSVC doesn't support aligned parameters by value.
 // I can't get the __sso_allocator to work here
 // for MSVC I think for this reason.
@@ -1112,9 +1115,13 @@ ctype<char>::classic_table()  _NOEXCEPT
 #elif defined(__sun__)
     return __ctype_mask;
 #elif defined(_LIBCPP_MSVCRT) || defined(__MINGW32__)
+#if _VC_CRT_MAJOR_VERSION < 14
+    // This is assumed to be safe, which is a nonsense assumption because we're
+    // going to end up dereferencing it later...
     return _ctype+1; // internal ctype mask table defined in msvcrt.dll
-// This is assumed to be safe, which is a nonsense assumption because we're
-// going to end up dereferencing it later...
+#else
+    return __pctype_func();
+#endif
 #elif defined(__EMSCRIPTEN__)
     return *__ctype_b_loc();
 #elif defined(_NEWLIB_VERSION)
@@ -3251,7 +3258,7 @@ __codecvt_utf8<wchar_t>::do_out(state_type&,
     const intern_type* frm, const intern_type* frm_end, const intern_type*& frm_nxt,
     extern_type* to, extern_type* to_end, extern_type*& to_nxt) const
 {
-#if defined(_WIN32)
+#if defined(_LIBCPP_SHORT_WCHAR)
     const uint16_t* _frm = reinterpret_cast<const uint16_t*>(frm);
     const uint16_t* _frm_end = reinterpret_cast<const uint16_t*>(frm_end);
     const uint16_t* _frm_nxt = _frm;
@@ -3263,7 +3270,7 @@ __codecvt_utf8<wchar_t>::do_out(state_type&,
     uint8_t* _to = reinterpret_cast<uint8_t*>(to);
     uint8_t* _to_end = reinterpret_cast<uint8_t*>(to_end);
     uint8_t* _to_nxt = _to;
-#if defined(_WIN32)
+#if defined(_LIBCPP_SHORT_WCHAR)
     result r = ucs2_to_utf8(_frm, _frm_end, _frm_nxt, _to, _to_end, _to_nxt,
                             _Maxcode_, _Mode_);
 #else
@@ -3283,7 +3290,7 @@ __codecvt_utf8<wchar_t>::do_in(state_type&,
     const uint8_t* _frm = reinterpret_cast<const uint8_t*>(frm);
     const uint8_t* _frm_end = reinterpret_cast<const uint8_t*>(frm_end);
     const uint8_t* _frm_nxt = _frm;
-#if defined(_WIN32)
+#if defined(_LIBCPP_SHORT_WCHAR)
     uint16_t* _to = reinterpret_cast<uint16_t*>(to);
     uint16_t* _to_end = reinterpret_cast<uint16_t*>(to_end);
     uint16_t* _to_nxt = _to;
@@ -4187,6 +4194,59 @@ __widen_from_utf8<32>::~__widen_from_utf8()
 {
 }
 
+
+static bool checked_string_to_wchar_convert(wchar_t& dest,
+                                            const char* ptr,
+                                            __locale_struct* loc) {
+  if (*ptr == '\0')
+    return false;
+  mbstate_t mb = {};
+  wchar_t out;
+  size_t ret = __libcpp_mbrtowc_l(&out, ptr, strlen(ptr), &mb, loc);
+  if (ret == static_cast<size_t>(-1) || ret == static_cast<size_t>(-2)) {
+    return false;
+  }
+  dest = out;
+  return true;
+}
+
+static bool checked_string_to_char_convert(char& dest,
+                                           const char* ptr,
+                                           __locale_struct* __loc) {
+  if (*ptr == '\0')
+    return false;
+  if (!ptr[1]) {
+    dest = *ptr;
+    return true;
+  }
+  // First convert the MBS into a wide char then attempt to narrow it using
+  // wctob_l.
+  wchar_t wout;
+  if (!checked_string_to_wchar_convert(wout, ptr, __loc))
+    return false;
+  int res;
+  if ((res = __libcpp_wctob_l(wout, __loc)) != char_traits<char>::eof()) {
+    dest = res;
+    return true;
+  }
+  // FIXME: Work around specific multibyte sequences that we can reasonable
+  // translate into a different single byte.
+  switch (wout) {
+  case L'\u00A0': // non-breaking space
+    dest = ' ';
+    return true;
+  default:
+    return false;
+  }
+  // _LIBCPP_UNREACHABLE();
+#ifdef __GNUC__
+  __builtin_unreachable();
+#else
+  _VSTD::abort();
+#endif
+}
+
+
 // numpunct<char> && numpunct<wchar_t>
 
 locale::id numpunct< char  >::id;
@@ -4258,10 +4318,10 @@ numpunct_byname<char>::__init(const char* nm)
                                 " failed to construct for " + string(nm));
 
         lconv* lc = __libcpp_localeconv_l(loc.get());
-        if (*lc->decimal_point)
-            __decimal_point_ = *lc->decimal_point;
-        if (*lc->thousands_sep)
-            __thousands_sep_ = *lc->thousands_sep;
+        checked_string_to_char_convert(__decimal_point_, lc->decimal_point,
+                                       loc.get());
+        checked_string_to_char_convert(__thousands_sep_, lc->thousands_sep,
+                                       loc.get());
         __grouping_ = lc->grouping;
         // localization for truename and falsename is not available
     }
@@ -4292,16 +4352,16 @@ numpunct_byname<wchar_t>::__init(const char* nm)
     {
         __locale_unique_ptr loc(newlocale(LC_ALL_MASK, nm, 0), freelocale);
         if (loc == nullptr)
-            __throw_runtime_error("numpunct_byname<char>::numpunct_byname"
+            __throw_runtime_error("numpunct_byname<wchar_t>::numpunct_byname"
                                 " failed to construct for " + string(nm));
 
         lconv* lc = __libcpp_localeconv_l(loc.get());
-        if (*lc->decimal_point)
-            __decimal_point_ = *lc->decimal_point;
-        if (*lc->thousands_sep)
-            __thousands_sep_ = *lc->thousands_sep;
+        checked_string_to_wchar_convert(__decimal_point_, lc->decimal_point,
+                                        loc.get());
+        checked_string_to_wchar_convert(__thousands_sep_, lc->thousands_sep,
+                                        loc.get());
         __grouping_ = lc->grouping;
-        // locallization for truename and falsename is not available
+        // localization for truename and falsename is not available
     }
 }
 
@@ -5783,14 +5843,15 @@ moneypunct_byname<char, false>::init(const char* nm)
                             " failed to construct for " + string(nm));
 
     lconv* lc = __libcpp_localeconv_l(loc.get());
-    if (*lc->mon_decimal_point)
-        __decimal_point_ = *lc->mon_decimal_point;
-    else
-        __decimal_point_ = base::do_decimal_point();
-    if (*lc->mon_thousands_sep)
-        __thousands_sep_ = *lc->mon_thousands_sep;
-    else
-        __thousands_sep_ = base::do_thousands_sep();
+    if (!checked_string_to_char_convert(__decimal_point_,
+                                        lc->mon_decimal_point,
+                                        loc.get()))
+      __decimal_point_ = base::do_decimal_point();
+    if (!checked_string_to_char_convert(__thousands_sep_,
+                                        lc->mon_thousands_sep,
+                                        loc.get()))
+      __thousands_sep_ = base::do_thousands_sep();
+
     __grouping_ = lc->mon_grouping;
     __curr_symbol_ = lc->currency_symbol;
     if (lc->frac_digits != CHAR_MAX)
@@ -5826,14 +5887,14 @@ moneypunct_byname<char, true>::init(const char* nm)
                             " failed to construct for " + string(nm));
 
     lconv* lc = __libcpp_localeconv_l(loc.get());
-    if (*lc->mon_decimal_point)
-        __decimal_point_ = *lc->mon_decimal_point;
-    else
-        __decimal_point_ = base::do_decimal_point();
-    if (*lc->mon_thousands_sep)
-        __thousands_sep_ = *lc->mon_thousands_sep;
-    else
-        __thousands_sep_ = base::do_thousands_sep();
+    if (!checked_string_to_char_convert(__decimal_point_,
+                                        lc->mon_decimal_point,
+                                        loc.get()))
+      __decimal_point_ = base::do_decimal_point();
+    if (!checked_string_to_char_convert(__thousands_sep_,
+                                        lc->mon_thousands_sep,
+                                        loc.get()))
+      __thousands_sep_ = base::do_thousands_sep();
     __grouping_ = lc->mon_grouping;
     __curr_symbol_ = lc->int_curr_symbol;
     if (lc->int_frac_digits != CHAR_MAX)
@@ -5885,14 +5946,14 @@ moneypunct_byname<wchar_t, false>::init(const char* nm)
         __throw_runtime_error("moneypunct_byname"
                             " failed to construct for " + string(nm));
     lconv* lc = __libcpp_localeconv_l(loc.get());
-    if (*lc->mon_decimal_point)
-        __decimal_point_ = static_cast<wchar_t>(*lc->mon_decimal_point);
-    else
-        __decimal_point_ = base::do_decimal_point();
-    if (*lc->mon_thousands_sep)
-        __thousands_sep_ = static_cast<wchar_t>(*lc->mon_thousands_sep);
-    else
-        __thousands_sep_ = base::do_thousands_sep();
+    if (!checked_string_to_wchar_convert(__decimal_point_,
+                                         lc->mon_decimal_point,
+                                         loc.get()))
+      __decimal_point_ = base::do_decimal_point();
+    if (!checked_string_to_wchar_convert(__thousands_sep_,
+                                         lc->mon_thousands_sep,
+                                         loc.get()))
+      __thousands_sep_ = base::do_thousands_sep();
     __grouping_ = lc->mon_grouping;
     wchar_t wbuf[100];
     mbstate_t mb = {0};
@@ -5951,14 +6012,14 @@ moneypunct_byname<wchar_t, true>::init(const char* nm)
                             " failed to construct for " + string(nm));
 
     lconv* lc = __libcpp_localeconv_l(loc.get());
-    if (*lc->mon_decimal_point)
-        __decimal_point_ = static_cast<wchar_t>(*lc->mon_decimal_point);
-    else
-        __decimal_point_ = base::do_decimal_point();
-    if (*lc->mon_thousands_sep)
-        __thousands_sep_ = static_cast<wchar_t>(*lc->mon_thousands_sep);
-    else
-        __thousands_sep_ = base::do_thousands_sep();
+    if (!checked_string_to_wchar_convert(__decimal_point_,
+                                         lc->mon_decimal_point,
+                                         loc.get()))
+      __decimal_point_ = base::do_decimal_point();
+    if (!checked_string_to_wchar_convert(__thousands_sep_,
+                                         lc->mon_thousands_sep,
+                                         loc.get()))
+      __thousands_sep_ = base::do_thousands_sep();
     __grouping_ = lc->mon_grouping;
     wchar_t wbuf[100];
     mbstate_t mb = {0};

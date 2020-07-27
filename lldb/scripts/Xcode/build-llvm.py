@@ -22,12 +22,12 @@ def LLVM_HASH_INCLUDES_DIFFS():
 
 
 def LLVM_REF():
-    llvm_ref = "master"
+    llvm_ref = "release_40"
     return llvm_ref
 
 
 def CLANG_REF():
-    clang_ref = "master"
+    clang_ref = "release_40"
     return clang_ref
 
 # For use with Xcode-style builds
@@ -346,7 +346,8 @@ def cmake_flags():
                     "-DCMAKE_C_FLAGS={}".format(get_c_flags()),
                     "-DCMAKE_CXX_FLAGS={}".format(get_cxx_flags()),
                     "-DCMAKE_EXE_LINKER_FLAGS={}".format(get_exe_linker_flags()),
-                    "-DCMAKE_SHARED_LINKER_FLAGS={}".format(get_shared_linker_flags())]
+                    "-DCMAKE_SHARED_LINKER_FLAGS={}".format(get_shared_linker_flags()),
+                    "-DHAVE_CRASHREPORTER_INFO=1"]
     deployment_target = get_deployment_target()
     if deployment_target:
         cmake_flags.append(

@@ -42,6 +42,9 @@ using namespace CodeGen;
 /// markers.
 static bool shouldEmitLifetimeMarkers(const CodeGenOptions &CGOpts,
                                       const LangOptions &LangOpts) {
+  if (CGOpts.DisableLifetimeMarkers)
+    return false;
+
   // Asan uses markers for use-after-scope checks.
   if (CGOpts.SanitizeAddressUseAfterScope)
     return true;
@@ -109,9 +112,8 @@ CodeGenFunction::~CodeGenFunction() {
   if (FirstBlockInfo)
     destroyBlockInfos(FirstBlockInfo);
 
-  if (getLangOpts().OpenMP) {
+  if (getLangOpts().OpenMP && CurFn)
     CGM.getOpenMPRuntime().functionFinished(*this);
-  }
 }
 
 CharUnits CodeGenFunction::getNaturalPointeeTypeAlignment(QualType T,
@@ -466,6 +468,23 @@ static void removeImageAccessQualifier(std::string& TyName) {
   }
 }
 
+// Returns the address space id that should be produced to the
+// kernel_arg_addr_space metadata. This is always fixed to the ids
+// as specified in the SPIR 2.0 specification in order to differentiate
+// for example in clGetKernelArgInfo() implementation between the address
+// spaces with targets without unique mapping to the OpenCL address spaces
+// (basically all single AS CPUs).
+static unsigned ArgInfoAddressSpace(unsigned LangAS) {
+  switch (LangAS) {
+  case LangAS::opencl_global:   return 1;
+  case LangAS::opencl_constant: return 2;
+  case LangAS::opencl_local:    return 3;
+  case LangAS::opencl_generic:  return 4; // Not in SPIR 2.0 specs.
+  default:
+    return 0; // Assume private.
+  }
+}
+
 // OpenCL v1.2 s5.6.4.6 allows the compiler to store kernel argument
 // information in the program executable. The argument information stored
 // includes the argument name, its type, the address and access qualifiers used.
@@ -506,7 +525,7 @@ static void GenOpenCLArgMetadata(const FunctionDecl *FD, llvm::Function *Fn,
 
       // Get address qualifier.
       addressQuals.push_back(llvm::ConstantAsMetadata::get(Builder.getInt32(
-          ASTCtx.getTargetAddressSpace(pointeeTy.getAddressSpace()))));
+        ArgInfoAddressSpace(pointeeTy.getAddressSpace()))));
 
       // Get argument type name.
       std::string typeName =
@@ -543,8 +562,7 @@ static void GenOpenCLArgMetadata(const FunctionDecl *FD, llvm::Function *Fn,
       uint32_t AddrSpc = 0;
       bool isPipe = ty->isPipeType();
       if (ty->isImageType() || isPipe)
-        AddrSpc =
-          CGM.getContext().getTargetAddressSpace(LangAS::opencl_global);
+        AddrSpc = ArgInfoAddressSpace(LangAS::opencl_global);
 
       addressQuals.push_back(
           llvm::ConstantAsMetadata::get(Builder.getInt32(AddrSpc)));
@@ -731,6 +749,20 @@ void CodeGenFunction::StartFunction(GlobalDecl GD,
   if (SanOpts.has(SanitizerKind::SafeStack))
     Fn->addFnAttr(llvm::Attribute::SafeStack);
 
+  // Ignore TSan memory acesses from within ObjC/ObjC++ dealloc, initialize,
+  // .cxx_destruct and all of their calees at run time.
+  if (SanOpts.has(SanitizerKind::Thread)) {
+    if (const auto *OMD = dyn_cast_or_null<ObjCMethodDecl>(D)) {
+      IdentifierInfo *II = OMD->getSelector().getIdentifierInfoForSlot(0);
+      if (OMD->getMethodFamily() == OMF_dealloc ||
+          OMD->getMethodFamily() == OMF_initialize ||
+          (OMD->getSelector().isUnarySelector() && II->isStr(".cxx_destruct"))) {
+        Fn->addFnAttr("sanitize_thread_no_checking_at_run_time");
+        Fn->removeFnAttr(llvm::Attribute::SanitizeThread);
+      }
+    }
+  }
+
   // Apply xray attributes to the function (as a string, for now)
   if (D && ShouldXRayInstrumentFunction()) {
     if (const auto *XRayAttr = D->getAttr<XRayInstrumentAttr>()) {
@@ -745,27 +777,9 @@ void CodeGenFunction::StartFunction(GlobalDecl GD,
     }
   }
 
-  // Pass inline keyword to optimizer if it appears explicitly on any
-  // declaration. Also, in the case of -fno-inline attach NoInline
-  // attribute to all functions that are not marked AlwaysInline, or
-  // to all functions that are not marked inline or implicitly inline
-  // in the case of -finline-hint-functions.
-  if (const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(D)) {
-    const CodeGenOptions& CodeGenOpts = CGM.getCodeGenOpts();
-    if (!CodeGenOpts.NoInline) {
-      for (auto RI : FD->redecls())
-        if (RI->isInlineSpecified()) {
-          Fn->addFnAttr(llvm::Attribute::InlineHint);
-          break;
-        }
-      if (CodeGenOpts.getInlining() == CodeGenOptions::OnlyHintInlining &&
-          !FD->isInlined() && !Fn->hasFnAttribute(llvm::Attribute::InlineHint))
-        Fn->addFnAttr(llvm::Attribute::NoInline);
-    } else if (!FD->hasAttr<AlwaysInlineAttr>())
-      Fn->addFnAttr(llvm::Attribute::NoInline);
+  if (const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(D))
     if (CGM.getLangOpts().OpenMP && FD->hasAttr<OMPDeclareSimdDeclAttr>())
       CGM.getOpenMPRuntime().emitDeclareSimdFunction(FD, Fn);
-  }
 
   // Add no-jump-tables value.
   Fn->addFnAttr("no-jump-tables",
@@ -1037,6 +1051,19 @@ QualType CodeGenFunction::BuildFunctionArgList(GlobalDecl GD,
   return ResTy;
 }
 
+static bool
+shouldUseUndefinedBehaviorReturnOptimization(const FunctionDecl *FD,
+                                             const ASTContext &Context) {
+  QualType T = FD->getReturnType();
+  // Avoid the optimization for functions that return a record type with a
+  // trivial destructor or another trivially copyable type.
+  if (const RecordType *RT = T.getCanonicalType()->getAs<RecordType>()) {
+    if (const auto *ClassDecl = dyn_cast<CXXRecordDecl>(RT->getDecl()))
+      return !ClassDecl->hasTrivialDestructor();
+  }
+  return !T.isTriviallyCopyableType(Context);
+}
+
 void CodeGenFunction::GenerateCode(GlobalDecl GD, llvm::Function *Fn,
                                    const CGFunctionInfo &FnInfo) {
   const FunctionDecl *FD = cast<FunctionDecl>(GD.getDecl());
@@ -1115,17 +1142,23 @@ void CodeGenFunction::GenerateCode(GlobalDecl GD, llvm::Function *Fn,
   //   function call is used by the caller, the behavior is undefined.
   if (getLangOpts().CPlusPlus && !FD->hasImplicitReturnZero() && !SawAsmBlock &&
       !FD->getReturnType()->isVoidType() && Builder.GetInsertBlock()) {
+    bool ShouldEmitUnreachable =
+        CGM.getCodeGenOpts().StrictReturn ||
+        shouldUseUndefinedBehaviorReturnOptimization(FD, getContext());
     if (SanOpts.has(SanitizerKind::Return)) {
       SanitizerScope SanScope(this);
       llvm::Value *IsFalse = Builder.getFalse();
       EmitCheck(std::make_pair(IsFalse, SanitizerKind::Return),
-                "missing_return", EmitCheckSourceLocation(FD->getLocation()),
-                None);
-    } else if (CGM.getCodeGenOpts().OptimizationLevel == 0) {
-      EmitTrapCall(llvm::Intrinsic::trap);
+                SanitizerHandler::MissingReturn,
+                EmitCheckSourceLocation(FD->getLocation()), None);
+    } else if (ShouldEmitUnreachable) {
+      if (CGM.getCodeGenOpts().OptimizationLevel == 0)
+        EmitTrapCall(llvm::Intrinsic::trap);
     }
-    Builder.CreateUnreachable();
-    Builder.ClearInsertionPoint();
+    if (SanOpts.has(SanitizerKind::Return) || ShouldEmitUnreachable) {
+      Builder.CreateUnreachable();
+      Builder.ClearInsertionPoint();
+    }
   }
 
   // Emit the standard function epilogue.
@@ -1828,7 +1861,7 @@ void CodeGenFunction::EmitVariablyModifiedType(QualType type) {
             };
             EmitCheck(std::make_pair(Builder.CreateICmpSGT(Size, Zero),
                                      SanitizerKind::VLABound),
-                      "vla_bound_not_positive", StaticArgs, Size);
+                      SanitizerHandler::VLABoundNotPositive, StaticArgs, Size);
           }
 
           // Always zexting here would be wrong if it weren't
@@ -2079,4 +2112,11 @@ void CodeGenFunction::EmitSanitizerStatReport(llvm::SanitizerStatKind SSK) {
   llvm::IRBuilder<> IRB(Builder.GetInsertBlock(), Builder.GetInsertPoint());
   IRB.SetCurrentDebugLocation(Builder.getCurrentDebugLocation());
   CGM.getSanStats().create(IRB, SSK);
+}
+
+llvm::DebugLoc CodeGenFunction::SourceLocToDebugLoc(SourceLocation Location) {
+  if (CGDebugInfo *DI = getDebugInfo())
+    return DI->SourceLocToDebugLoc(Location);
+
+  return llvm::DebugLoc();
 }

@@ -162,13 +162,12 @@ Instruction *InstCombiner::foldSelectOpOp(SelectInst &SI, Instruction *TI,
                             TI->getType());
   }
 
-  // TODO: This function ends awkwardly in unreachable - fix to be more normal.
-
   // Only handle binary operators with one-use here. As with the cast case
   // above, it may be possible to relax the one-use constraint, but that needs
   // be examined carefully since it may not reduce the total number of
   // instructions.
-  if (!isa<BinaryOperator>(TI) || !TI->hasOneUse() || !FI->hasOneUse())
+  BinaryOperator *BO = dyn_cast<BinaryOperator>(TI);
+  if (!BO || !TI->hasOneUse() || !FI->hasOneUse())
     return nullptr;
 
   // Figure out if the operations have any operands in common.
@@ -203,14 +202,9 @@ Instruction *InstCombiner::foldSelectOpOp(SelectInst &SI, Instruction *TI,
   // If we reach here, they do have operations in common.
   Value *NewSI = Builder->CreateSelect(SI.getCondition(), OtherOpT, OtherOpF,
                                        SI.getName() + ".v", &SI);
-
-  if (BinaryOperator *BO = dyn_cast<BinaryOperator>(TI)) {
-    if (MatchIsOpZero)
-      return BinaryOperator::Create(BO->getOpcode(), MatchOp, NewSI);
-    else
-      return BinaryOperator::Create(BO->getOpcode(), NewSI, MatchOp);
-  }
-  llvm_unreachable("Shouldn't get here");
+  Value *Op0 = MatchIsOpZero ? MatchOp : NewSI;
+  Value *Op1 = MatchIsOpZero ? NewSI : MatchOp;
+  return BinaryOperator::Create(BO->getOpcode(), Op0, Op1);
 }
 
 static bool isSelect01(Constant *C1, Constant *C2) {
@@ -428,9 +422,11 @@ static bool adjustMinMax(SelectInst &Sel, ICmpInst &Cmp) {
   if (!Cmp.hasOneUse() || !match(CmpRHS, m_APInt(CmpC)))
     return false;
 
-  // These transforms only work for selects of integers or vector integers.
-  auto *SelEltTy = dyn_cast<IntegerType>(Sel.getType()->getScalarType());
-  if (!SelEltTy)
+  // These transforms only work for selects of integers or vector selects of
+  // integer vectors.
+  Type *SelTy = Sel.getType();
+  auto *SelEltTy = dyn_cast<IntegerType>(SelTy->getScalarType());
+  if (!SelEltTy || SelTy->isVectorTy() != Cmp.getType()->isVectorTy())
     return false;
 
   Constant *AdjustedRHS;
@@ -451,7 +447,7 @@ static bool adjustMinMax(SelectInst &Sel, ICmpInst &Cmp) {
   // all to the larger type. This enables scalar evolution to analyze this
   // expression.
   else if (CmpRHS->getType()->getScalarSizeInBits() < SelEltTy->getBitWidth()) {
-    Constant *SextRHS = ConstantExpr::getSExt(AdjustedRHS, Sel.getType());
+    Constant *SextRHS = ConstantExpr::getSExt(AdjustedRHS, SelTy);
 
     // X = sext x; x >s c ? X : C+1 --> X = sext x; X <s C+1 ? C+1 : X
     // X = sext x; x <s c ? X : C-1 --> X = sext x; X >s C-1 ? C-1 : X
@@ -465,7 +461,7 @@ static bool adjustMinMax(SelectInst &Sel, ICmpInst &Cmp) {
       CmpLHS = FalseVal;
       AdjustedRHS = SextRHS;
     } else if (Cmp.isUnsigned()) {
-      Constant *ZextRHS = ConstantExpr::getZExt(AdjustedRHS, Sel.getType());
+      Constant *ZextRHS = ConstantExpr::getZExt(AdjustedRHS, SelTy);
       // X = zext x; x >u c ? X : C+1 --> X = zext x; X <u C+1 ? C+1 : X
       // X = zext x; x <u c ? X : C-1 --> X = zext x; X >u C-1 ? C-1 : X
       // zext + signed compare cannot be changed:
@@ -504,9 +500,50 @@ static bool adjustMinMax(SelectInst &Sel, ICmpInst &Cmp) {
   return true;
 }
 
+/// If this is an integer min/max where the select's 'true' operand is a
+/// constant, canonicalize that constant to the 'false' operand:
+/// select (icmp Pred X, C), C, X --> select (icmp Pred' X, C), X, C
+static Instruction *
+canonicalizeMinMaxWithConstant(SelectInst &Sel, ICmpInst &Cmp,
+                               InstCombiner::BuilderTy &Builder) {
+  // TODO: We should also canonicalize min/max when the select has a different
+  // constant value than the cmp constant, but we need to fix the backend first.
+  if (!Cmp.hasOneUse() || !isa<Constant>(Cmp.getOperand(1)) ||
+      !isa<Constant>(Sel.getTrueValue()) ||
+      isa<Constant>(Sel.getFalseValue()) ||
+      Cmp.getOperand(1) != Sel.getTrueValue())
+    return nullptr;
+
+  // Canonicalize the compare predicate based on whether we have min or max.
+  Value *LHS, *RHS;
+  ICmpInst::Predicate NewPred;
+  SelectPatternResult SPR = matchSelectPattern(&Sel, LHS, RHS);
+  switch (SPR.Flavor) {
+  case SPF_SMIN: NewPred = ICmpInst::ICMP_SLT; break;
+  case SPF_UMIN: NewPred = ICmpInst::ICMP_ULT; break;
+  case SPF_SMAX: NewPred = ICmpInst::ICMP_SGT; break;
+  case SPF_UMAX: NewPred = ICmpInst::ICMP_UGT; break;
+  default: return nullptr;
+  }
+
+  // Canonicalize the constant to the right side.
+  if (isa<Constant>(LHS))
+    std::swap(LHS, RHS);
+
+  Value *NewCmp = Builder.CreateICmp(NewPred, LHS, RHS);
+  SelectInst *NewSel = SelectInst::Create(NewCmp, LHS, RHS, "", nullptr, &Sel);
+
+  // We swapped the select operands, so swap the metadata too.
+  NewSel->swapProfMetadata();
+  return NewSel;
+}
+
 /// Visit a SelectInst that has an ICmpInst as its first operand.
 Instruction *InstCombiner::foldSelectInstWithICmp(SelectInst &SI,
                                                   ICmpInst *ICI) {
+  if (Instruction *NewSel = canonicalizeMinMaxWithConstant(SI, *ICI, *Builder))
+    return NewSel;
+
   bool Changed = adjustMinMax(SI, *ICI);
 
   ICmpInst::Predicate Pred = ICI->getPredicate();
@@ -957,21 +994,18 @@ Instruction *InstCombiner::foldSelectExtConst(SelectInst &Sel) {
   // If one arm of the select is the extend of the condition, replace that arm
   // with the extension of the appropriate known bool value.
   if (Cond == X) {
-    SelectInst *NewSel;
     if (ExtInst == Sel.getTrueValue()) {
       // select X, (sext X), C --> select X, -1, C
       // select X, (zext X), C --> select X,  1, C
       Constant *One = ConstantInt::getTrue(SmallType);
       Constant *AllOnesOrOne = ConstantExpr::getCast(ExtOpcode, One, SelType);
-      NewSel = SelectInst::Create(Cond, AllOnesOrOne, C);
+      return SelectInst::Create(Cond, AllOnesOrOne, C, "", nullptr, &Sel);
     } else {
       // select X, C, (sext X) --> select X, C, 0
       // select X, C, (zext X) --> select X, C, 0
       Constant *Zero = ConstantInt::getNullValue(SelType);
-      NewSel = SelectInst::Create(Cond, C, Zero);
+      return SelectInst::Create(Cond, C, Zero, "", nullptr, &Sel);
     }
-    NewSel->copyMetadata(Sel);
-    return NewSel;
   }
 
   return nullptr;
@@ -1303,29 +1337,25 @@ Instruction *InstCombiner::visitSelectInst(SelectInst &SI) {
     }
 
     // MAX(~a, ~b) -> ~MIN(a, b)
-    if (SPF == SPF_SMAX || SPF == SPF_UMAX) {
-      if (IsFreeToInvert(LHS, LHS->hasNUses(2)) &&
-          IsFreeToInvert(RHS, RHS->hasNUses(2))) {
+    if ((SPF == SPF_SMAX || SPF == SPF_UMAX) &&
+        IsFreeToInvert(LHS, LHS->hasNUses(2)) &&
+        IsFreeToInvert(RHS, RHS->hasNUses(2))) {
+      // For this transform to be profitable, we need to eliminate at least two
+      // 'not' instructions if we're going to add one 'not' instruction.
+      int NumberOfNots =
+          (LHS->hasNUses(2) && match(LHS, m_Not(m_Value()))) +
+          (RHS->hasNUses(2) && match(RHS, m_Not(m_Value()))) +
+          (SI.hasOneUse() && match(*SI.user_begin(), m_Not(m_Value())));
 
-        // This transform adds a xor operation and that extra cost needs to be
-        // justified.  We look for simplifications that will result from
-        // applying this rule:
-
-        bool Profitable =
-            (LHS->hasNUses(2) && match(LHS, m_Not(m_Value()))) ||
-            (RHS->hasNUses(2) && match(RHS, m_Not(m_Value()))) ||
-            (SI.hasOneUse() && match(*SI.user_begin(), m_Not(m_Value())));
-
-        if (Profitable) {
-          Value *NewLHS = Builder->CreateNot(LHS);
-          Value *NewRHS = Builder->CreateNot(RHS);
-          Value *NewCmp = SPF == SPF_SMAX
-                              ? Builder->CreateICmpSLT(NewLHS, NewRHS)
-                              : Builder->CreateICmpULT(NewLHS, NewRHS);
-          Value *NewSI =
-              Builder->CreateNot(Builder->CreateSelect(NewCmp, NewLHS, NewRHS));
-          return replaceInstUsesWith(SI, NewSI);
-        }
+      if (NumberOfNots >= 2) {
+        Value *NewLHS = Builder->CreateNot(LHS);
+        Value *NewRHS = Builder->CreateNot(RHS);
+        Value *NewCmp = SPF == SPF_SMAX
+                            ? Builder->CreateICmpSLT(NewLHS, NewRHS)
+                            : Builder->CreateICmpULT(NewLHS, NewRHS);
+        Value *NewSI =
+            Builder->CreateNot(Builder->CreateSelect(NewCmp, NewLHS, NewRHS));
+        return replaceInstUsesWith(SI, NewSI);
       }
     }
 

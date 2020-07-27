@@ -318,7 +318,7 @@ bool CallAnalyzer::accumulateGEPOffset(GEPOperator &GEP, APInt &Offset) {
       continue;
 
     // Handle a struct index, which adds its field offset to the pointer.
-    if (StructType *STy = dyn_cast<StructType>(*GTI)) {
+    if (StructType *STy = GTI.getStructTypeOrNull()) {
       unsigned ElementIdx = OpC->getZExtValue();
       const StructLayout *SL = DL.getStructLayout(STy);
       Offset += APInt(IntPtrWidth, SL->getElementOffset(ElementIdx));
@@ -636,29 +636,26 @@ void CallAnalyzer::updateThreshold(CallSite CS, Function &Callee) {
   else if (Caller->optForSize())
     Threshold = MinIfValid(Threshold, Params.OptSizeThreshold);
 
-  bool HotCallsite = false;
-  uint64_t TotalWeight;
-  if (CS.getInstruction()->extractProfTotalWeight(TotalWeight) &&
-      PSI->isHotCount(TotalWeight)) {
-    HotCallsite = true;
+  // Adjust the threshold based on inlinehint attribute and profile based
+  // hotness information if the caller does not have MinSize attribute.
+  if (!Caller->optForMinSize()) {
+    if (Callee.hasFnAttribute(Attribute::InlineHint))
+      Threshold = MaxIfValid(Threshold, Params.HintThreshold);
+    if (PSI) {
+      uint64_t TotalWeight;
+      if (CS.getInstruction()->extractProfTotalWeight(TotalWeight) &&
+          PSI->isHotCount(TotalWeight)) {
+        Threshold = MaxIfValid(Threshold, Params.HotCallSiteThreshold);
+      } else if (PSI->isFunctionEntryHot(&Callee)) {
+        // If callsite hotness can not be determined, we may still know
+        // that the callee is hot and treat it as a weaker hint for threshold
+        // increase.
+        Threshold = MaxIfValid(Threshold, Params.HintThreshold);
+      } else if (PSI->isFunctionEntryCold(&Callee)) {
+        Threshold = MinIfValid(Threshold, Params.ColdThreshold);
+      }
+    }
   }
-
-  // Listen to the inlinehint attribute or profile based hotness information
-  // when it would increase the threshold and the caller does not need to
-  // minimize its size.
-  bool InlineHint = Callee.hasFnAttribute(Attribute::InlineHint) ||
-                    PSI->isFunctionEntryHot(&Callee);
-  if (InlineHint && !Caller->optForMinSize())
-    Threshold = MaxIfValid(Threshold, Params.HintThreshold);
-
-  if (HotCallsite && !Caller->optForMinSize())
-    Threshold = MaxIfValid(Threshold, Params.HotCallSiteThreshold);
-
-  bool ColdCallee = PSI->isFunctionEntryCold(&Callee);
-  // For cold callees, use the ColdThreshold knob if it is available and reduces
-  // the threshold.
-  if (ColdCallee)
-    Threshold = MinIfValid(Threshold, Params.ColdThreshold);
 
   // Finally, take the target-specific inlining threshold multiplier into
   // account.
@@ -1255,7 +1252,9 @@ bool CallAnalyzer::analyzeCall(CallSite CS) {
       Cost -= InlineConstants::InstrCost;
     }
   }
-
+  // The call instruction also disappears after inlining.
+  Cost -= InlineConstants::InstrCost + InlineConstants::CallPenalty;
+  
   // If there is only one call of the function, and it has internal linkage,
   // the cost of inlining it drops dramatically.
   bool OnlyOneCallAndLocalLinkage =
@@ -1484,7 +1483,7 @@ InlineCost llvm::getInlineCost(
 
   // Don't inline functions which can be interposed at link-time.  Don't inline
   // functions marked noinline or call sites marked noinline.
-  // Note: inlining non-exact non-interposable fucntions is fine, since we know
+  // Note: inlining non-exact non-interposable functions is fine, since we know
   // we have *a* correct implementation of the source level function.
   if (Callee->isInterposable() || Callee->hasFnAttribute(Attribute::NoInline) ||
       CS.isNoInline())

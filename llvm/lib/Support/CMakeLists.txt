@@ -55,11 +55,12 @@ add_llvm_library(LLVMSupport
   FileOutputBuffer.cpp
   FoldingSet.cpp
   FormattedStream.cpp
+  FormatVariadic.cpp
+  GlobPattern.cpp
   GraphWriter.cpp
   Hashing.cpp
   IntEqClasses.cpp
   IntervalMap.cpp
-  IntrusiveRefCntPtr.cpp
   JamCRC.cpp
   LEB128.cpp
   LineIterator.cpp
@@ -89,10 +90,12 @@ add_llvm_library(LLVMSupport
   StringSaver.cpp
   StringRef.cpp
   SystemUtils.cpp
+  TarWriter.cpp
   TargetParser.cpp
   ThreadPool.cpp
   Timer.cpp
   ToolOutputFile.cpp
+  TrigramIndex.cpp
   Triple.cpp
   Twine.cpp
   Unicode.cpp
@@ -123,7 +126,6 @@ add_llvm_library(LLVMSupport
   TargetRegistry.cpp
   ThreadLocal.cpp
   Threading.cpp
-  TimeValue.cpp
   Valgrind.cpp
   Watchdog.cpp
 

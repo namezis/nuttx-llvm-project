@@ -51,6 +51,7 @@ Flags &Log::GetMask() { return m_mask_bits; }
 const Flags &Log::GetMask() const { return m_mask_bits; }
 
 void Log::PutCString(const char *cstr) { Printf("%s", cstr); }
+void Log::PutString(llvm::StringRef str) { PutCString(str.str().c_str()); }
 
 //----------------------------------------------------------------------
 // Simple variable argument logging with flags.
@@ -107,16 +108,16 @@ void Log::VAPrintf(const char *format, va_list args) {
       llvm::raw_string_ostream stream(back_trace);
       llvm::sys::PrintStackTrace(stream);
       stream.flush();
-      header.PutCString(back_trace.c_str());
+      header.PutCString(back_trace);
     }
 
     if (m_options.Test(LLDB_LOG_OPTION_THREADSAFE)) {
       static std::recursive_mutex g_LogThreadedMutex;
       std::lock_guard<std::recursive_mutex> guard(g_LogThreadedMutex);
-      stream_sp->PutCString(header.GetString().c_str());
+      stream_sp->PutCString(header.GetString());
       stream_sp->Flush();
     } else {
-      stream_sp->PutCString(header.GetString().c_str());
+      stream_sp->PutCString(header.GetString());
       stream_sp->Flush();
     }
   }
@@ -128,20 +129,6 @@ void Log::VAPrintf(const char *format, va_list args) {
 //----------------------------------------------------------------------
 void Log::Debug(const char *format, ...) {
   if (!GetOptions().Test(LLDB_LOG_OPTION_DEBUG))
-    return;
-
-  va_list args;
-  va_start(args, format);
-  VAPrintf(format, args);
-  va_end(args);
-}
-
-//----------------------------------------------------------------------
-// Print debug strings if and only if the global debug option is set to
-// a non-zero value.
-//----------------------------------------------------------------------
-void Log::DebugVerbose(const char *format, ...) {
-  if (!GetOptions().AllSet(LLDB_LOG_OPTION_DEBUG | LLDB_LOG_OPTION_VERBOSE))
     return;
 
   va_list args;
@@ -185,24 +172,6 @@ void Log::VAError(const char *format, va_list args) {
 }
 
 //----------------------------------------------------------------------
-// Printing of errors that ARE fatal. Exit with ERR exit code
-// immediately.
-//----------------------------------------------------------------------
-void Log::FatalError(int err, const char *format, ...) {
-  char *arg_msg = nullptr;
-  va_list args;
-  va_start(args, format);
-  ::vasprintf(&arg_msg, format, args);
-  va_end(args);
-
-  if (arg_msg != nullptr) {
-    Printf("error: %s", arg_msg);
-    ::free(arg_msg);
-  }
-  ::exit(err);
-}
-
-//----------------------------------------------------------------------
 // Printing of warnings that are not fatal only if verbose mode is
 // enabled.
 //----------------------------------------------------------------------
@@ -214,27 +183,6 @@ void Log::Verbose(const char *format, ...) {
   va_start(args, format);
   VAPrintf(format, args);
   va_end(args);
-}
-
-//----------------------------------------------------------------------
-// Printing of warnings that are not fatal only if verbose mode is
-// enabled.
-//----------------------------------------------------------------------
-void Log::WarningVerbose(const char *format, ...) {
-  if (!m_options.Test(LLDB_LOG_OPTION_VERBOSE))
-    return;
-
-  char *arg_msg = nullptr;
-  va_list args;
-  va_start(args, format);
-  ::vasprintf(&arg_msg, format, args);
-  va_end(args);
-
-  if (arg_msg == nullptr)
-    return;
-
-  Printf("warning: %s", arg_msg);
-  free(arg_msg);
 }
 
 //----------------------------------------------------------------------

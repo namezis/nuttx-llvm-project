@@ -500,7 +500,7 @@ bool MipsAsmPrinter::PrintAsmOperand(const MachineInstr *MI, unsigned OpNum,
 
       unsigned RegOp = OpNum;
       if (!Subtarget->isGP64bit()){
-        // Endianess reverses which register holds the high or low value
+        // Endianness reverses which register holds the high or low value
         // between M and L.
         switch(ExtraCode[0]) {
         case 'M':
@@ -1035,6 +1035,22 @@ void MipsAsmPrinter::EmitEndOfAsmFile(Module &M) {
 void MipsAsmPrinter::PrintDebugValueComment(const MachineInstr *MI,
                                            raw_ostream &OS) {
   // TODO: implement
+}
+
+// Emit .dtprelword or .dtpreldword directive
+// and value for debug thread local expression.
+void MipsAsmPrinter::EmitDebugValue(const MCExpr *Value,
+                                          unsigned Size) const {
+  switch (Size) {
+  case 4:
+    OutStreamer->EmitDTPRel32Value(Value);
+    break;
+  case 8:
+    OutStreamer->EmitDTPRel64Value(Value);
+    break;
+  default:
+    llvm_unreachable("Unexpected size of expression value.");
+  }
 }
 
 // Align all targets of indirect branches on bundle size.  Used only if target

@@ -217,7 +217,7 @@ ConstString ObjCLanguage::MethodName::GetFullNameWithoutCategory(
         strm.PutChar('-');
       strm.Printf("[%s %s]", GetClassName().GetCString(),
                   GetSelector().GetCString());
-      return ConstString(strm.GetString().c_str());
+      return ConstString(strm.GetString());
     }
 
     if (!empty_if_no_category) {
@@ -242,25 +242,25 @@ size_t ObjCLanguage::MethodName::GetFullNames(std::vector<ConstString> &names,
       if (category) {
         strm.Printf("%c[%s %s]", is_class_method ? '+' : '-',
                     GetClassName().GetCString(), GetSelector().GetCString());
-        names.push_back(ConstString(strm.GetString().c_str()));
+        names.emplace_back(strm.GetString());
       }
     } else {
       const ConstString &class_name = GetClassName();
       const ConstString &selector = GetSelector();
       strm.Printf("+[%s %s]", class_name.GetCString(), selector.GetCString());
-      names.push_back(ConstString(strm.GetString().c_str()));
+      names.emplace_back(strm.GetString());
       strm.Clear();
       strm.Printf("-[%s %s]", class_name.GetCString(), selector.GetCString());
-      names.push_back(ConstString(strm.GetString().c_str()));
+      names.emplace_back(strm.GetString());
       strm.Clear();
       if (category) {
         strm.Printf("+[%s(%s) %s]", class_name.GetCString(),
                     category.GetCString(), selector.GetCString());
-        names.push_back(ConstString(strm.GetString().c_str()));
+        names.emplace_back(strm.GetString());
         strm.Clear();
         strm.Printf("-[%s(%s) %s]", class_name.GetCString(),
                     category.GetCString(), selector.GetCString());
-        names.push_back(ConstString(strm.GetString().c_str()));
+        names.emplace_back(strm.GetString());
       }
     }
   }
@@ -994,10 +994,23 @@ std::unique_ptr<Language::TypeScavenger> ObjCLanguage::GetTypeScavenger() {
 
     friend class lldb_private::ObjCLanguage;
   };
+  
+  class ObjCDebugInfoScavenger : public Language::ImageListTypeScavenger {
+  public:
+    virtual CompilerType AdjustForInclusion(CompilerType &candidate) override {
+      LanguageType lang_type(candidate.GetMinimumLanguage());
+      if (!Language::LanguageIsObjC(lang_type))
+        return CompilerType();
+      if (candidate.IsTypedefType())
+        return candidate.GetTypedefedType();
+      return candidate;
+    }
+  };
 
   return std::unique_ptr<TypeScavenger>(
       new Language::EitherTypeScavenger<ObjCModulesScavenger,
-                                        ObjCRuntimeScavenger>());
+                                        ObjCRuntimeScavenger,
+                                        ObjCDebugInfoScavenger>());
 }
 
 bool ObjCLanguage::GetFormatterPrefixSuffix(ValueObject &valobj,

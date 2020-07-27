@@ -23,16 +23,22 @@
 #include "SIISelLowering.h"
 #include "SIFrameLowering.h"
 #include "Utils/AMDGPUBaseInfo.h"
+#include "llvm/ADT/Triple.h"
 #include "llvm/CodeGen/GlobalISel/GISelAccessor.h"
+#include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/SelectionDAGTargetInfo.h"
-#include "llvm/Target/TargetSubtargetInfo.h"
+#include "llvm/MC/MCInstrItineraries.h"
+#include "llvm/Support/MathExtras.h"
+#include <cassert>
+#include <cstdint>
+#include <memory>
+#include <utility>
 
 #define GET_SUBTARGETINFO_HEADER
 #include "AMDGPUGenSubtargetInfo.inc"
 
 namespace llvm {
 
-class SIMachineFunctionInfo;
 class StringRef;
 
 class AMDGPUSubtarget : public AMDGPUGenSubtargetInfo {
@@ -75,6 +81,7 @@ protected:
   bool HalfRate64Ops;
 
   // Dynamially set bits that enable features.
+  bool FP16Denormals;
   bool FP32Denormals;
   bool FP64Denormals;
   bool FPExceptions;
@@ -113,6 +120,7 @@ protected:
   bool CFALUBug;
   bool HasVertexCache;
   short TexVTXClauseSize;
+  bool ScalarizeGlobal;
 
   // Dummy feature to use for assembler in tablegen.
   bool FeatureDisable;
@@ -123,7 +131,8 @@ protected:
 public:
   AMDGPUSubtarget(const Triple &TT, StringRef GPU, StringRef FS,
                   const TargetMachine &TM);
-  virtual ~AMDGPUSubtarget();
+  ~AMDGPUSubtarget() override;
+
   AMDGPUSubtarget &initializeSubtargetDependencies(const Triple &TT,
                                                    StringRef GPU, StringRef FS);
 
@@ -270,6 +279,9 @@ public:
   /// the given LDS memory size is the only constraint.
   unsigned getOccupancyWithLocalMemSize(uint32_t Bytes) const;
 
+  bool hasFP16Denormals() const {
+    return FP16Denormals;
+  }
 
   bool hasFP32Denormals() const {
     return FP32Denormals;
@@ -299,22 +311,31 @@ public:
     return EnableXNACK;
   }
 
-  bool isAmdCodeObjectV2() const {
-    return isAmdHsaOS() || isMesa3DOS();
+  bool isMesaKernel(const MachineFunction &MF) const {
+    return isMesa3DOS() && !AMDGPU::isShader(MF.getFunction()->getCallingConv());
+  }
+
+  // Covers VS/PS/CS graphics shaders
+  bool isMesaGfxShader(const MachineFunction &MF) const {
+    return isMesa3DOS() && AMDGPU::isShader(MF.getFunction()->getCallingConv());
+  }
+
+  bool isAmdCodeObjectV2(const MachineFunction &MF) const {
+    return isAmdHsaOS() || isMesaKernel(MF);
   }
 
   /// \brief Returns the offset in bytes from the start of the input buffer
   ///        of the first explicit kernel argument.
-  unsigned getExplicitKernelArgOffset() const {
-    return isAmdCodeObjectV2() ? 0 : 36;
+  unsigned getExplicitKernelArgOffset(const MachineFunction &MF) const {
+    return isAmdCodeObjectV2(MF) ? 0 : 36;
   }
 
   unsigned getAlignmentForImplicitArgPtr() const {
     return isAmdHsaOS() ? 8 : 4;
   }
 
-  unsigned getImplicitArgNumBytes() const {
-    if (isMesa3DOS())
+  unsigned getImplicitArgNumBytes(const MachineFunction &MF) const {
+    if (isMesaKernel(MF))
       return 16;
     if (isAmdHsaOS() && isOpenCLEnv())
       return 32;
@@ -396,6 +417,9 @@ public:
   unsigned getWavesPerWorkGroup(unsigned FlatWorkGroupSize) const {
     return alignTo(FlatWorkGroupSize, getWavefrontSize()) / getWavefrontSize();
   }
+
+  void setScalarizeGlobalBehavior(bool b) { ScalarizeGlobal = b;}
+  bool getScalarizeGlobalBehavior() const { return ScalarizeGlobal;}
 
   /// \returns Subtarget's default pair of minimum/maximum flat work group sizes
   /// for function \p F, or minimum/maximum flat work group sizes explicitly
@@ -570,7 +594,7 @@ public:
     return getGeneration() != AMDGPUSubtarget::SOUTHERN_ISLANDS;
   }
 
-  unsigned getKernArgSegmentSize(unsigned ExplictArgBytes) const;
+  unsigned getKernArgSegmentSize(const MachineFunction &MF, unsigned ExplictArgBytes) const;
 
   /// Return the maximum number of waves per SIMD for kernels using \p SGPRs SGPRs
   unsigned getOccupancyWithNumSGPRs(unsigned SGPRs) const;
@@ -587,6 +611,6 @@ public:
   unsigned getMaxNumSGPRs() const;
 };
 
-} // End namespace llvm
+} // end namespace llvm
 
-#endif
+#endif // LLVM_LIB_TARGET_AMDGPU_AMDGPUSUBTARGET_H

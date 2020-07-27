@@ -651,7 +651,8 @@ Error ProcessGDBRemote::WillAttachToProcessWithName(const char *process_name,
   return WillLaunchOrAttach();
 }
 
-Error ProcessGDBRemote::DoConnectRemote(Stream *strm, const char *remote_url) {
+Error ProcessGDBRemote::DoConnectRemote(Stream *strm,
+                                        llvm::StringRef remote_url) {
   Log *log(ProcessGDBRemoteLog::GetLogIfAllCategoriesSet(GDBR_LOG_PROCESS));
   Error error(WillLaunchOrAttach());
 
@@ -695,15 +696,15 @@ Error ProcessGDBRemote::DoConnectRemote(Stream *strm, const char *remote_url) {
       if (state != eStateInvalid) {
         SetPrivateState(state);
       } else
-        error.SetErrorStringWithFormat("Process %" PRIu64
-                                       " was reported after connecting to "
-                                       "'%s', but state was not stopped: %s",
-                                       pid, remote_url, StateAsCString(state));
+        error.SetErrorStringWithFormat(
+            "Process %" PRIu64 " was reported after connecting to "
+            "'%s', but state was not stopped: %s",
+            pid, remote_url.str().c_str(), StateAsCString(state));
     } else
       error.SetErrorStringWithFormat("Process %" PRIu64
                                      " was reported after connecting to '%s', "
                                      "but no stop reply packet was received",
-                                     pid, remote_url);
+                                     pid, remote_url.str().c_str());
   }
 
   if (log)
@@ -963,15 +964,15 @@ Error ProcessGDBRemote::DoLaunch(Module *exe_module,
   return error;
 }
 
-Error ProcessGDBRemote::ConnectToDebugserver(const char *connect_url) {
+Error ProcessGDBRemote::ConnectToDebugserver(llvm::StringRef connect_url) {
   Error error;
   // Only connect if we have a valid connect URL
   Log *log(ProcessGDBRemoteLog::GetLogIfAllCategoriesSet(GDBR_LOG_PROCESS));
 
-  if (connect_url && connect_url[0]) {
+  if (!connect_url.empty()) {
     if (log)
       log->Printf("ProcessGDBRemote::%s Connecting to %s", __FUNCTION__,
-                  connect_url);
+                  connect_url.str().c_str());
     std::unique_ptr<ConnectionFileDescriptor> conn_ap(
         new ConnectionFileDescriptor());
     if (conn_ap.get()) {
@@ -1226,7 +1227,7 @@ Error ProcessGDBRemote::DoAttachToProcessWithName(
 
       m_async_broadcaster.BroadcastEvent(
           eBroadcastBitAsyncContinue,
-          new EventDataBytes(packet.GetData(), packet.GetSize()));
+          new EventDataBytes(packet.GetString().data(), packet.GetSize()));
 
     } else
       SetExitStatus(-1, error.AsCString());
@@ -1330,7 +1331,7 @@ Error ProcessGDBRemote::DoResume() {
         }
 
         if (continue_packet_error)
-          continue_packet.GetString().clear();
+          continue_packet.Clear();
       }
     } else
       continue_packet_error = true;
@@ -1455,11 +1456,10 @@ Error ProcessGDBRemote::DoResume() {
 
       m_async_broadcaster.BroadcastEvent(
           eBroadcastBitAsyncContinue,
-          new EventDataBytes(continue_packet.GetData(),
+          new EventDataBytes(continue_packet.GetString().data(),
                              continue_packet.GetSize()));
 
-      if (listener_sp->WaitForEvent(std::chrono::seconds(5), event_sp) ==
-          false) {
+      if (listener_sp->GetEvent(event_sp, std::chrono::seconds(5)) == false) {
         error.SetErrorString("Resume timed out.");
         if (log)
           log->Printf("ProcessGDBRemote::DoResume: Resume timed out.");
@@ -2321,7 +2321,7 @@ StateType ProcessGDBRemote::SetThreadStopInfo(StringExtractor &stop_packet) {
         reason = "watchpoint";
         StreamString ostr;
         ostr.Printf("%" PRIu64 " %" PRIu32, wp_addr, wp_index);
-        description = ostr.GetString().c_str();
+        description = ostr.GetString();
       } else if (key.compare("library") == 0) {
         LoadModules();
       } else if (key.size() == 2 && ::isxdigit(key[0]) && ::isxdigit(key[1])) {
@@ -2812,10 +2812,10 @@ size_t ProcessGDBRemote::DoWriteMemory(addr_t addr, const void *buf,
     else
       error.SetErrorStringWithFormat(
           "unexpected response to GDB server memory write packet '%s': '%s'",
-          packet.GetString().c_str(), response.GetStringRef().c_str());
+          packet.GetData(), response.GetStringRef().c_str());
   } else {
     error.SetErrorStringWithFormat("failed to send packet: '%s'",
-                                   packet.GetString().c_str());
+                                   packet.GetData());
   }
   return 0;
 }
@@ -3353,7 +3353,7 @@ Error ProcessGDBRemote::LaunchAndConnectToDebugserver(
     if (m_gdb_comm.IsConnected()) {
       // Finish the connection process by doing the handshake without connecting
       // (send NULL URL)
-      ConnectToDebugserver(NULL);
+      ConnectToDebugserver("");
     } else {
       error.SetErrorString("connection failed");
     }
@@ -3533,8 +3533,7 @@ thread_result_t ProcessGDBRemote::AsyncThread(void *arg) {
       log->Printf("ProcessGDBRemote::%s (arg = %p, pid = %" PRIu64
                   ") listener.WaitForEvent (NULL, event_sp)...",
                   __FUNCTION__, arg, process->GetID());
-    if (process->m_async_listener_sp->WaitForEvent(std::chrono::microseconds(0),
-                                                   event_sp)) {
+    if (process->m_async_listener_sp->GetEvent(event_sp, llvm::None)) {
       const uint32_t event_type = event_sp->GetType();
       if (event_sp->BroadcasterIs(&process->m_async_broadcaster)) {
         if (log)
@@ -4043,8 +4042,7 @@ bool ProcessGDBRemote::GetModuleSpec(const FileSpec &module_file_spec,
     module_spec.Dump(stream);
     log->Printf("ProcessGDBRemote::%s - got module info for (%s:%s) : %s",
                 __FUNCTION__, module_file_spec.GetPath().c_str(),
-                arch.GetTriple().getTriple().c_str(),
-                stream.GetString().c_str());
+                arch.GetTriple().getTriple().c_str(), stream.GetData());
   }
 
   m_cached_module_specs[key] = module_spec;
@@ -4579,7 +4577,7 @@ size_t ProcessGDBRemote::LoadModules(LoadedModuleInfoList &module_list) {
     if (!modInfo.get_link_map(link_map))
       link_map = LLDB_INVALID_ADDRESS;
 
-    FileSpec file(mod_name.c_str(), true);
+    FileSpec file(mod_name, true);
     lldb::ModuleSP module_sp =
         LoadModuleAtAddress(file, link_map, mod_base, mod_base_is_offset);
 
@@ -4836,7 +4834,7 @@ ParseStructuredDataPacket(llvm::StringRef packet) {
       json_str.Flush();
       log->Printf("ProcessGDBRemote::%s() "
                   "received Async StructuredData packet: %s",
-                  __FUNCTION__, json_str.GetString().c_str());
+                  __FUNCTION__, json_str.GetData());
     } else {
       log->Printf("ProcessGDBRemote::%s"
                   "() received StructuredData packet:"
@@ -4905,13 +4903,11 @@ public:
         const uint64_t max_send = m_max_send.GetOptionValue().GetCurrentValue();
         const uint64_t max_recv = m_max_recv.GetOptionValue().GetCurrentValue();
         const bool json = m_json.GetOptionValue().GetCurrentValue();
-        if (output_stream_sp)
-          process->GetGDBRemote().TestPacketSpeed(
-              num_packets, max_send, max_recv, json, *output_stream_sp);
-        else {
-          process->GetGDBRemote().TestPacketSpeed(
-              num_packets, max_send, max_recv, json, result.GetOutputStream());
-        }
+        const uint64_t k_recv_amount =
+            4 * 1024 * 1024; // Receive amount in bytes
+        process->GetGDBRemote().TestPacketSpeed(
+            num_packets, max_send, max_recv, k_recv_amount, json,
+            output_stream_sp ? *output_stream_sp : result.GetOutputStream());
         result.SetStatus(eReturnStatusSuccessFinishResult);
         return true;
       }
@@ -5085,7 +5081,7 @@ public:
           packet.GetString(), response, send_async);
       result.SetStatus(eReturnStatusSuccessFinishResult);
       Stream &output_strm = result.GetOutputStream();
-      output_strm.Printf("  packet: %s\n", packet.GetString().c_str());
+      output_strm.Printf("  packet: %s\n", packet.GetData());
       const std::string &response_str = response.GetStringRef();
 
       if (response_str.empty())

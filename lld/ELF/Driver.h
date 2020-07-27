@@ -16,7 +16,6 @@
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
-#include "llvm/IR/LLVMContext.h"
 #include "llvm/Option/ArgList.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -30,12 +29,9 @@ public:
   void main(ArrayRef<const char *> Args, bool CanExitEarly);
   void addFile(StringRef Path);
   void addLibrary(StringRef Name);
-  llvm::LLVMContext Context;      // to parse bitcode files
-  std::unique_ptr<CpioFile> Cpio; // for reproduce
 
 private:
   std::vector<MemoryBufferRef> getArchiveMembers(MemoryBufferRef MB);
-  llvm::Optional<MemoryBufferRef> readFile(StringRef Path);
   void readConfigs(llvm::opt::InputArgList &Args);
   void createFiles(llvm::opt::InputArgList &Args);
   void inferMachineType();
@@ -51,7 +47,6 @@ private:
   bool InBinary = false;
 
   std::vector<InputFile *> Files;
-  std::vector<std::unique_ptr<MemoryBuffer>> OwningMBs;
 };
 
 // Parses command line options.
@@ -74,9 +69,8 @@ std::vector<uint8_t> parseHexstring(StringRef S);
 
 std::string createResponseFile(const llvm::opt::InputArgList &Args);
 
-std::string findFromSearchPaths(StringRef Path);
-std::string searchLibrary(StringRef Path);
-std::string buildSysrootedPath(llvm::StringRef Dir, llvm::StringRef File);
+llvm::Optional<std::string> findFromSearchPaths(StringRef Path);
+llvm::Optional<std::string> searchLibrary(StringRef Path);
 
 } // namespace elf
 } // namespace lld

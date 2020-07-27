@@ -15,6 +15,7 @@
 
 #include "llvm/Transforms/InstrProfiling.h"
 #include "llvm/ADT/Triple.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
@@ -30,6 +31,11 @@ namespace {
 cl::opt<bool> DoNameCompression("enable-name-compression",
                                 cl::desc("Enable name string compression"),
                                 cl::init(true));
+
+cl::opt<bool> DoHashBasedCounterSplit(
+    "hash-based-counter-split",
+    cl::desc("Rename counter variable of a comdat function based on cfg hash"),
+    cl::init(true));
 
 cl::opt<bool> ValueProfileStaticAlloc(
     "vp-static-alloc",
@@ -57,26 +63,34 @@ public:
     return "Frontend instrumentation-based coverage lowering";
   }
 
-  bool runOnModule(Module &M) override { return InstrProf.run(M); }
+  bool runOnModule(Module &M) override {
+    return InstrProf.run(M, getAnalysis<TargetLibraryInfoWrapperPass>().getTLI());
+  }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.setPreservesCFG();
+    AU.addRequired<TargetLibraryInfoWrapperPass>();
   }
 };
 
 } // anonymous namespace
 
 PreservedAnalyses InstrProfiling::run(Module &M, ModuleAnalysisManager &AM) {
-  if (!run(M))
+  auto &TLI = AM.getResult<TargetLibraryAnalysis>(M);
+  if (!run(M, TLI))
     return PreservedAnalyses::all();
 
   return PreservedAnalyses::none();
 }
 
 char InstrProfilingLegacyPass::ID = 0;
-INITIALIZE_PASS(InstrProfilingLegacyPass, "instrprof",
-                "Frontend instrumentation-based coverage lowering.", false,
-                false)
+INITIALIZE_PASS_BEGIN(
+    InstrProfilingLegacyPass, "instrprof",
+    "Frontend instrumentation-based coverage lowering.", false, false)
+INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
+INITIALIZE_PASS_END(
+    InstrProfilingLegacyPass, "instrprof",
+    "Frontend instrumentation-based coverage lowering.", false, false)
 
 ModulePass *
 llvm::createInstrProfilingLegacyPass(const InstrProfOptions &Options) {
@@ -114,10 +128,11 @@ static InstrProfIncrementInst *castToIncrementInst(Instruction *Instr) {
   return dyn_cast<InstrProfIncrementInst>(Instr);
 }
 
-bool InstrProfiling::run(Module &M) {
+bool InstrProfiling::run(Module &M, const TargetLibraryInfo &TLI) {
   bool MadeChange = false;
 
   this->M = &M;
+  this->TLI = &TLI;
   NamesVar = nullptr;
   NamesSize = 0;
   ProfileDataMap.clear();
@@ -173,7 +188,8 @@ bool InstrProfiling::run(Module &M) {
   return true;
 }
 
-static Constant *getOrInsertValueProfilingCall(Module &M) {
+static Constant *getOrInsertValueProfilingCall(Module &M,
+                                               const TargetLibraryInfo &TLI) {
   LLVMContext &Ctx = M.getContext();
   auto *ReturnTy = Type::getVoidTy(M.getContext());
   Type *ParamTypes[] = {
@@ -182,8 +198,13 @@ static Constant *getOrInsertValueProfilingCall(Module &M) {
   };
   auto *ValueProfilingCallTy =
       FunctionType::get(ReturnTy, makeArrayRef(ParamTypes), false);
-  return M.getOrInsertFunction(getInstrProfValueProfFuncName(),
-                               ValueProfilingCallTy);
+  Constant *Res = M.getOrInsertFunction(getInstrProfValueProfFuncName(),
+                                        ValueProfilingCallTy);
+  if (Function *FunRes = dyn_cast<Function>(Res)) {
+    if (auto AK = TLI.getExtAttrForI32Param(false))
+      FunRes->addAttribute(3, AK);
+  }
+  return Res;
 }
 
 void InstrProfiling::computeNumValueSiteCounts(InstrProfValueProfileInst *Ind) {
@@ -217,8 +238,11 @@ void InstrProfiling::lowerValueProfileInst(InstrProfValueProfileInst *Ind) {
   Value *Args[3] = {Ind->getTargetValue(),
                     Builder.CreateBitCast(DataVar, Builder.getInt8PtrTy()),
                     Builder.getInt32(Index)};
-  Ind->replaceAllUsesWith(
-      Builder.CreateCall(getOrInsertValueProfilingCall(*M), Args));
+  CallInst *Call = Builder.CreateCall(getOrInsertValueProfilingCall(*M, *TLI),
+                                      Args);
+  if (auto AK = TLI->getExtAttrForI32Param(false))
+    Call->addAttribute(3, AK);
+  Ind->replaceAllUsesWith(Call);
   Ind->eraseFromParent();
 }
 
@@ -253,7 +277,16 @@ void InstrProfiling::lowerCoverageData(GlobalVariable *CoverageNamesVar) {
 static std::string getVarName(InstrProfIncrementInst *Inc, StringRef Prefix) {
   StringRef NamePrefix = getInstrProfNameVarPrefix();
   StringRef Name = Inc->getName()->getName().substr(NamePrefix.size());
-  return (Prefix + Name).str();
+  Function *F = Inc->getParent()->getParent();
+  Module *M = F->getParent();
+  if (!DoHashBasedCounterSplit || !isIRPGOFlagSet(M) ||
+      !canRenameComdatFunc(*F))
+    return (Prefix + Name).str();
+  uint64_t FuncHash = Inc->getHash()->getZExtValue();
+  SmallVector<char, 24> HashPostfix;
+  if (Name.endswith((Twine(".") + Twine(FuncHash)).toStringRef(HashPostfix)))
+    return (Prefix + Name).str();
+  return (Prefix + Name + "." + Twine(FuncHash)).str();
 }
 
 static inline bool shouldRecordFunctionAddr(Function *F) {

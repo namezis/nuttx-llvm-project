@@ -229,10 +229,11 @@ Module::Module(const ModuleSpec &module_spec)
 
 Module::Module(const FileSpec &file_spec, const ArchSpec &arch,
                const ConstString *object_name, lldb::offset_t object_offset,
-               const TimeValue *object_mod_time_ptr)
+               const llvm::sys::TimePoint<> &object_mod_time)
     : m_mod_time(FileSystem::GetModificationTime(file_spec)), m_arch(arch),
       m_file(file_spec), m_object_offset(object_offset),
-      m_file_has_changed(false), m_first_file_changed_log(false) {
+      m_object_mod_time(object_mod_time), m_file_has_changed(false),
+      m_first_file_changed_log(false) {
   // Scope for locker below...
   {
     std::lock_guard<std::recursive_mutex> guard(
@@ -242,9 +243,6 @@ Module::Module(const FileSpec &file_spec, const ArchSpec &arch,
 
   if (object_name)
     m_object_name = *object_name;
-
-  if (object_mod_time_ptr)
-    m_object_mod_time = *object_mod_time_ptr;
 
   Log *log(lldb_private::GetLogIfAnyCategoriesSet(LIBLLDB_LOG_OBJECT |
                                                   LIBLLDB_LOG_MODULES));
@@ -318,7 +316,7 @@ ObjectFile *Module::GetMemoryObjectFile(const lldb::ProcessSP &process_sp,
         if (m_objfile_sp) {
           StreamString s;
           s.Printf("0x%16.16" PRIx64, header_addr);
-          m_object_name.SetCString(s.GetData());
+          m_object_name.SetString(s.GetString());
 
           // Once we get the object file, update our module with the object
           // file's
@@ -997,8 +995,8 @@ size_t Module::FindTypes(
     TypeList &types) {
   size_t num_matches = 0;
   const char *type_name_cstr = name.GetCString();
-  std::string type_scope;
-  std::string type_basename;
+  llvm::StringRef type_scope;
+  llvm::StringRef type_basename;
   const bool append = true;
   TypeClass type_class = eTypeClassAny;
   TypeMap typesmap;
@@ -1008,13 +1006,9 @@ size_t Module::FindTypes(
     // from the root namespace and implies and exact match. The typenames we
     // get back from clang do not start with "::" so we need to strip this off
     // in order to get the qualified names to match
+    exact_match = type_scope.consume_front("::");
 
-    if (type_scope.size() >= 2 && type_scope[0] == ':' &&
-        type_scope[1] == ':') {
-      type_scope.erase(0, 2);
-      exact_match = true;
-    }
-    ConstString type_basename_const_str(type_basename.c_str());
+    ConstString type_basename_const_str(type_basename);
     if (FindTypes_Impl(sc, type_basename_const_str, nullptr, append,
                        max_matches, searched_symbol_files, typesmap)) {
       typesmap.RemoveMismatchedTypes(type_scope, type_basename, type_class,
@@ -1120,7 +1114,7 @@ void Module::ReportError(const char *format, ...) {
       if (last_char != '\n' || last_char != '\r')
         strm.EOL();
     }
-    Host::SystemLog(Host::eSystemLogError, "%s", strm.GetString().c_str());
+    Host::SystemLog(Host::eSystemLogError, "%s", strm.GetData());
   }
 }
 
@@ -1154,7 +1148,7 @@ void Module::ReportErrorIfModifyDetected(const char *format, ...) {
         }
         strm.PutCString("The debug session should be aborted as the original "
                         "debug information has been overwritten.\n");
-        Host::SystemLog(Host::eSystemLogError, "%s", strm.GetString().c_str());
+        Host::SystemLog(Host::eSystemLogError, "%s", strm.GetData());
       }
     }
   }
@@ -1178,7 +1172,7 @@ void Module::ReportWarning(const char *format, ...) {
       if (last_char != '\n' || last_char != '\r')
         strm.EOL();
     }
-    Host::SystemLog(Host::eSystemLogWarning, "%s", strm.GetString().c_str());
+    Host::SystemLog(Host::eSystemLogWarning, "%s", strm.GetData());
   }
 }
 
@@ -1191,7 +1185,7 @@ void Module::LogMessage(Log *log, const char *format, ...) {
     va_start(args, format);
     log_message.PrintfVarArg(format, args);
     va_end(args);
-    log->PutCString(log_message.GetString().c_str());
+    log->PutCString(log_message.GetData());
   }
 }
 
@@ -1208,9 +1202,9 @@ void Module::LogMessageVerboseBacktrace(Log *log, const char *format, ...) {
       std::string back_trace;
       llvm::raw_string_ostream stream(back_trace);
       llvm::sys::PrintStackTrace(stream);
-      log_message.PutCString(back_trace.c_str());
+      log_message.PutCString(back_trace);
     }
-    log->PutCString(log_message.GetString().c_str());
+    log->PutCString(log_message.GetData());
   }
 }
 

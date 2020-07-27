@@ -277,16 +277,14 @@ void FileSpec::Resolve(llvm::SmallVectorImpl<char> &path) {
   }
 }
 
-FileSpec::FileSpec()
-    : m_directory(), m_filename(), m_syntax(FileSystem::GetNativePathSyntax()) {
-}
+FileSpec::FileSpec() : m_syntax(FileSystem::GetNativePathSyntax()) {}
 
 //------------------------------------------------------------------
 // Default constructor that can take an optional full path to a
 // file on disk.
 //------------------------------------------------------------------
 FileSpec::FileSpec(llvm::StringRef path, bool resolve_path, PathSyntax syntax)
-    : m_directory(), m_filename(), m_is_resolved(false), m_syntax(syntax) {
+    : m_syntax(syntax) {
   SetFile(path, resolve_path, syntax);
 }
 
@@ -356,10 +354,10 @@ void FileSpec::SetFile(llvm::StringRef pathname, bool resolve,
     m_is_resolved = true;
   }
 
-  Normalize(resolved, syntax);
+  Normalize(resolved, m_syntax);
 
   llvm::StringRef resolve_path_ref(resolved.c_str());
-  size_t dir_end = ParentPathEnd(resolve_path_ref, syntax);
+  size_t dir_end = ParentPathEnd(resolve_path_ref, m_syntax);
   if (dir_end == 0) {
     m_filename.SetString(resolve_path_ref);
     return;
@@ -368,11 +366,11 @@ void FileSpec::SetFile(llvm::StringRef pathname, bool resolve,
   m_directory.SetString(resolve_path_ref.substr(0, dir_end));
 
   size_t filename_begin = dir_end;
-  size_t root_dir_start = RootDirStart(resolve_path_ref, syntax);
+  size_t root_dir_start = RootDirStart(resolve_path_ref, m_syntax);
   while (filename_begin != llvm::StringRef::npos &&
          filename_begin < resolve_path_ref.size() &&
          filename_begin != root_dir_start &&
-         IsPathSeparator(resolve_path_ref[filename_begin], syntax))
+         IsPathSeparator(resolve_path_ref[filename_begin], m_syntax))
     ++filename_begin;
   m_filename.SetString((filename_begin == llvm::StringRef::npos ||
                         filename_begin >= resolve_path_ref.size())
@@ -546,7 +544,8 @@ bool FileSpec::Equal(const FileSpec &a, const FileSpec &b, bool full,
 FileSpec FileSpec::GetNormalizedPath() const {
   // Fast path. Do nothing if the path is not interesting.
   if (!m_directory.GetStringRef().contains(".") &&
-      (m_filename.GetStringRef() != ".." && m_filename.GetStringRef() != "."))
+      !m_directory.GetStringRef().contains("//") &&
+      m_filename.GetStringRef() != ".." && m_filename.GetStringRef() != ".")
     return *this;
 
   llvm::SmallString<64> path, result;
@@ -610,7 +609,7 @@ FileSpec FileSpec::GetNormalizedPath() const {
 void FileSpec::Dump(Stream *s) const {
   if (s) {
     std::string path{GetPath(true)};
-    s->PutCString(path.c_str());
+    s->PutCString(path);
     char path_separator = GetPreferredPathSeparator(m_syntax);
     if (!m_filename && !path.empty() && path.back() != path_separator)
       s->PutChar(path_separator);
@@ -1387,3 +1386,46 @@ bool FileSpec::IsRelative() const {
 }
 
 bool FileSpec::IsAbsolute() const { return !FileSpec::IsRelative(); }
+
+void llvm::format_provider<FileSpec>::format(const FileSpec &F,
+                                             raw_ostream &Stream,
+                                             StringRef Style) {
+  assert(
+      (Style.empty() || Style.equals_lower("F") || Style.equals_lower("D")) &&
+      "Invalid FileSpec style!");
+
+  StringRef dir = F.GetDirectory().GetStringRef();
+  StringRef file = F.GetFilename().GetStringRef();
+
+  if (dir.empty() && file.empty()) {
+    Stream << "(empty)";
+    return;
+  }
+
+  if (Style.equals_lower("F")) {
+    Stream << (file.empty() ? "(empty)" : file);
+    return;
+  }
+
+  // Style is either D or empty, either way we need to print the directory.
+  if (!dir.empty()) {
+    // Directory is stored in normalized form, which might be different
+    // than preferred form.  In order to handle this, we need to cut off
+    // the filename, then denormalize, then write the entire denorm'ed
+    // directory.
+    llvm::SmallString<64> denormalized_dir = dir;
+    Denormalize(denormalized_dir, F.GetPathSyntax());
+    Stream << denormalized_dir;
+    Stream << GetPreferredPathSeparator(F.GetPathSyntax());
+  }
+
+  if (Style.equals_lower("D")) {
+    // We only want to print the directory, so now just exit.
+    if (dir.empty())
+      Stream << "(empty)";
+    return;
+  }
+
+  if (!file.empty())
+    Stream << file;
+}

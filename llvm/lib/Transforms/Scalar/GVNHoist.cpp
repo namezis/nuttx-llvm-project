@@ -200,9 +200,12 @@ static void combineKnownMetadata(Instruction *ReplInst, Instruction *I) {
 class GVNHoist {
 public:
   GVNHoist(DominatorTree *DT, AliasAnalysis *AA, MemoryDependenceResults *MD,
-           MemorySSA *MSSA, bool OptForMinSize)
-      : DT(DT), AA(AA), MD(MD), MSSA(MSSA), OptForMinSize(OptForMinSize),
-        HoistingGeps(OptForMinSize), HoistedCtr(0) {}
+           MemorySSA *MSSA)
+      : DT(DT), AA(AA), MD(MD), MSSA(MSSA),
+        HoistingGeps(false),
+        HoistedCtr(0)
+  { }
+
   bool run(Function &F) {
     VN.setDomTree(DT);
     VN.setAliasAnalysis(AA);
@@ -246,7 +249,6 @@ private:
   AliasAnalysis *AA;
   MemoryDependenceResults *MD;
   MemorySSA *MSSA;
-  const bool OptForMinSize;
   const bool HoistingGeps;
   DenseMap<const Value *, unsigned> DFSNumber;
   BBSideEffectsSet BBSideEffects;
@@ -391,16 +393,16 @@ private:
         continue;
       }
 
+      // Stop walk once the limit is reached.
+      if (NBBsOnAllPaths == 0)
+        return true;
+
       // Impossible to hoist with exceptions on the path.
       if (hasEH(*I))
         return true;
 
       // Check that we do not move a store past loads.
       if (hasMemoryUse(NewPt, Def, *I))
-        return true;
-
-      // Stop walk once the limit is reached.
-      if (NBBsOnAllPaths == 0)
         return true;
 
       // -1 is unlimited number of blocks on all paths.
@@ -433,12 +435,12 @@ private:
         continue;
       }
 
-      // Impossible to hoist with exceptions on the path.
-      if (hasEH(*I))
-        return true;
-
       // Stop walk once the limit is reached.
       if (NBBsOnAllPaths == 0)
+        return true;
+
+      // Impossible to hoist with exceptions on the path.
+      if (hasEH(*I))
         return true;
 
       // -1 is unlimited number of blocks on all paths.
@@ -500,10 +502,8 @@ private:
   bool safeToHoistScalar(const BasicBlock *HoistBB,
                          SmallPtrSetImpl<const BasicBlock *> &WL,
                          int &NBBsOnAllPaths) {
-    // Check that the hoisted expression is needed on all paths.  Enable scalar
-    // hoisting at -Oz as it is safe to hoist scalars to a place where they are
-    // partially needed.
-    if (!OptForMinSize && !hoistingFromAllPaths(HoistBB, WL))
+    // Check that the hoisted expression is needed on all paths.
+    if (!hoistingFromAllPaths(HoistBB, WL))
       return false;
 
     for (const BasicBlock *BB : WL)
@@ -530,7 +530,7 @@ private:
       std::sort(InstructionsToHoist.begin(), InstructionsToHoist.end(), Pred);
     }
 
-    int NBBsOnAllPaths = MaxNumberOfBBSInPath;
+    int NumBBsOnAllPaths = MaxNumberOfBBSInPath;
 
     SmallVecImplInsn::iterator II = InstructionsToHoist.begin();
     SmallVecImplInsn::iterator Start = II;
@@ -546,10 +546,12 @@ private:
       BasicBlock *NewHoistBB;
       Instruction *NewHoistPt;
 
-      if (BB == HoistBB) {
+      if (BB == HoistBB) { // Both are in the same Basic Block.
         NewHoistBB = HoistBB;
         NewHoistPt = firstInBB(Insn, HoistPt) ? Insn : HoistPt;
       } else {
+        // If the hoisting point contains one of the instructions,
+        // then hoist there, otherwise hoist before the terminator.
         NewHoistBB = DT->findNearestCommonDominator(HoistBB, BB);
         if (NewHoistBB == BB)
           NewHoistPt = Insn;
@@ -564,7 +566,7 @@ private:
       WL.insert(BB);
 
       if (K == InsKind::Scalar) {
-        if (safeToHoistScalar(NewHoistBB, WL, NBBsOnAllPaths)) {
+        if (safeToHoistScalar(NewHoistBB, WL, NumBBsOnAllPaths)) {
           // Extend HoistPt to NewHoistPt.
           HoistPt = NewHoistPt;
           HoistBB = NewHoistBB;
@@ -581,9 +583,9 @@ private:
              hoistingFromAllPaths(NewHoistBB, WL)) &&
             // Also check that it is safe to move the load or store from HoistPt
             // to NewHoistPt, and from Insn to NewHoistPt.
-            safeToHoistLdSt(NewHoistPt, HoistPt, UD, K, NBBsOnAllPaths) &&
+            safeToHoistLdSt(NewHoistPt, HoistPt, UD, K, NumBBsOnAllPaths) &&
             safeToHoistLdSt(NewHoistPt, Insn, MSSA->getMemoryAccess(Insn),
-                            K, NBBsOnAllPaths)) {
+                            K, NumBBsOnAllPaths)) {
           // Extend HoistPt to NewHoistPt.
           HoistPt = NewHoistPt;
           HoistBB = NewHoistBB;
@@ -602,7 +604,7 @@ private:
         UD = MSSA->getMemoryAccess(*Start);
       HoistPt = Insn;
       HoistBB = BB;
-      NBBsOnAllPaths = MaxNumberOfBBSInPath;
+      NumBBsOnAllPaths = MaxNumberOfBBSInPath;
     }
 
     // Save the last partition.
@@ -792,6 +794,7 @@ private:
 
         // Move the instruction at the end of HoistPt.
         Instruction *Last = HoistPt->getTerminator();
+        MD->removeInstruction(Repl);
         Repl->moveBefore(Last);
 
         DFSNumber[Repl] = DFSNumber[Last]++;
@@ -912,13 +915,8 @@ private:
                 Intr->getIntrinsicID() == Intrinsic::assume)
               continue;
           }
-          if (Call->mayHaveSideEffects()) {
-            if (!OptForMinSize)
-              break;
-            // We may continue hoisting across calls which write to memory.
-            if (Call->mayThrow())
-              break;
-          }
+          if (Call->mayHaveSideEffects())
+            break;
 
           if (Call->isConvergent())
             break;
@@ -960,7 +958,7 @@ public:
     auto &MD = getAnalysis<MemoryDependenceWrapperPass>().getMemDep();
     auto &MSSA = getAnalysis<MemorySSAWrapperPass>().getMSSA();
 
-    GVNHoist G(&DT, &AA, &MD, &MSSA, F.optForMinSize());
+    GVNHoist G(&DT, &AA, &MD, &MSSA);
     return G.run(F);
   }
 
@@ -980,7 +978,7 @@ PreservedAnalyses GVNHoistPass::run(Function &F, FunctionAnalysisManager &AM) {
   AliasAnalysis &AA = AM.getResult<AAManager>(F);
   MemoryDependenceResults &MD = AM.getResult<MemoryDependenceAnalysis>(F);
   MemorySSA &MSSA = AM.getResult<MemorySSAAnalysis>(F).getMSSA();
-  GVNHoist G(&DT, &AA, &MD, &MSSA, F.optForMinSize());
+  GVNHoist G(&DT, &AA, &MD, &MSSA);
   if (!G.run(F))
     return PreservedAnalyses::all();
 

@@ -18,18 +18,33 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOGDI
 #include <windows.h>
-#include <dbghelp.h>
 #include <io.h>
 #include <psapi.h>
 #include <stdlib.h>
 
 #include "sanitizer_common.h"
+#include "sanitizer_dbghelp.h"
 #include "sanitizer_libc.h"
 #include "sanitizer_mutex.h"
 #include "sanitizer_placement_new.h"
 #include "sanitizer_procmaps.h"
 #include "sanitizer_stacktrace.h"
 #include "sanitizer_symbolizer.h"
+
+// A macro to tell the compiler that this part of the code cannot be reached,
+// if the compiler supports this feature. Since we're using this in
+// code that is called when terminating the process, the expansion of the
+// macro should not terminate the process to avoid infinite recursion.
+#if defined(__clang__)
+# define BUILTIN_UNREACHABLE() __builtin_unreachable()
+#elif defined(__GNUC__) && \
+    (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 5))
+# define BUILTIN_UNREACHABLE() __builtin_unreachable()
+#elif defined(_MSC_VER)
+# define BUILTIN_UNREACHABLE() __assume(0)
+#else
+# define BUILTIN_UNREACHABLE()
+#endif
 
 namespace __sanitizer {
 
@@ -234,8 +249,7 @@ bool MprotectNoAccess(uptr addr, uptr size) {
   return VirtualProtect((LPVOID)addr, size, PAGE_NOACCESS, &old_protection);
 }
 
-
-void ReleaseMemoryToOS(uptr addr, uptr size) {
+void ReleaseMemoryPagesToOS(uptr beg, uptr end) {
   // This is almost useless on 32-bits.
   // FIXME: add madvise-analog when we move to 64-bits.
 }
@@ -374,6 +388,8 @@ void DumpProcessMap() {
 }
 #endif
 
+void PrintModuleMap() { }
+
 void DisableCoreDumperIfNecessary() {
   // Do nothing.
 }
@@ -425,8 +441,6 @@ u64 NanoTime() {
 }
 
 void Abort() {
-  if (::IsDebuggerPresent())
-    __debugbreak();
   internal__exit(3);
 }
 
@@ -656,7 +670,13 @@ uptr internal_sched_yield() {
 }
 
 void internal__exit(int exitcode) {
-  ExitProcess(exitcode);
+  // ExitProcess runs some finalizers, so use TerminateProcess to avoid that.
+  // The debugger doesn't stop on TerminateProcess like it does on ExitProcess,
+  // so add our own breakpoint here.
+  if (::IsDebuggerPresent())
+    __debugbreak();
+  TerminateProcess(GetCurrentProcess(), exitcode);
+  BUILTIN_UNREACHABLE();
 }
 
 uptr internal_ftruncate(fd_t fd, uptr size) {
@@ -778,8 +798,8 @@ void BufferedStackTrace::SlowUnwindStackWithContext(uptr pc, void *context,
   stack_frame.AddrFrame.Mode = AddrModeFlat;
   stack_frame.AddrStack.Mode = AddrModeFlat;
   while (StackWalk64(machine_type, GetCurrentProcess(), GetCurrentThread(),
-                     &stack_frame, &ctx, NULL, &SymFunctionTableAccess64,
-                     &SymGetModuleBase64, NULL) &&
+                     &stack_frame, &ctx, NULL, SymFunctionTableAccess64,
+                     SymGetModuleBase64, NULL) &&
          size < Min(max_depth, kStackTraceMax)) {
     trace_buffer[size++] = (uptr)stack_frame.AddrPC.Offset;
   }
@@ -867,6 +887,10 @@ SignalContext SignalContext::Create(void *siginfo, void *context) {
   bool is_memory_access = write_flag != SignalContext::UNKNOWN;
   return SignalContext(context, access_addr, pc, sp, bp, is_memory_access,
                        write_flag);
+}
+
+void SignalContext::DumpAllRegisters(void *context) {
+  // FIXME: Implement this.
 }
 
 uptr ReadBinaryName(/*out*/char *buf, uptr buf_len) {

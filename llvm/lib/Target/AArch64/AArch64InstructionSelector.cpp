@@ -18,6 +18,7 @@
 #include "AArch64RegisterInfo.h"
 #include "AArch64Subtarget.h"
 #include "AArch64TargetMachine.h"
+#include "MCTargetDesc/AArch64AddressingModes.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
@@ -34,6 +35,8 @@ using namespace llvm;
 #ifndef LLVM_BUILD_GLOBAL_ISEL
 #error "You shouldn't build this"
 #endif
+
+#include "AArch64GenGlobalISel.inc"
 
 AArch64InstructionSelector::AArch64InstructionSelector(
     const AArch64TargetMachine &TM, const AArch64Subtarget &STI,
@@ -138,6 +141,7 @@ static unsigned selectBinaryOp(unsigned GenericOpc, unsigned RegBankID,
       case TargetOpcode::G_AND:
         return AArch64::ANDWrr;
       case TargetOpcode::G_ADD:
+        assert(OpSize != 32 && "s32 G_ADD should have been selected");
         return AArch64::ADDWrr;
       case TargetOpcode::G_SUB:
         return AArch64::SUBWrr;
@@ -162,7 +166,6 @@ static unsigned selectBinaryOp(unsigned GenericOpc, unsigned RegBankID,
         return AArch64::EORXrr;
       case TargetOpcode::G_AND:
         return AArch64::ANDXrr;
-      case TargetOpcode::G_ADD:
       case TargetOpcode::G_GEP:
         return AArch64::ADDXrr;
       case TargetOpcode::G_SUB:
@@ -484,10 +487,40 @@ bool AArch64InstructionSelector::select(MachineInstr &I) const {
 
     if (Opcode ==  TargetOpcode::LOAD_STACK_GUARD)
       return constrainSelectedInstRegOperands(I, TII, TRI, RBI);
-    else if (I.isCopy())
+
+    if (Opcode == TargetOpcode::PHI) {
+      const unsigned DefReg = I.getOperand(0).getReg();
+      const LLT DefTy = MRI.getType(DefReg);
+
+      const TargetRegisterClass *DefRC = nullptr;
+      if (TargetRegisterInfo::isPhysicalRegister(DefReg)) {
+        DefRC = TRI.getRegClass(DefReg);
+      } else {
+        const RegClassOrRegBank &RegClassOrBank =
+            MRI.getRegClassOrRegBank(DefReg);
+
+        DefRC = RegClassOrBank.dyn_cast<const TargetRegisterClass *>();
+        if (!DefRC) {
+          if (!DefTy.isValid()) {
+            DEBUG(dbgs() << "PHI operand has no type, not a gvreg?\n");
+            return false;
+          }
+          const RegisterBank &RB = *RegClassOrBank.get<const RegisterBank *>();
+          DefRC = getRegClassForTypeOnBank(DefTy, RB, RBI);
+          if (!DefRC) {
+            DEBUG(dbgs() << "PHI operand has unexpected size/bank\n");
+            return false;
+          }
+        }
+      }
+
+      return RBI.constrainGenericRegister(DefReg, *DefRC, MRI);
+    }
+
+    if (I.isCopy())
       return selectCopy(I, TII, MRI, TRI, RBI);
-    else
-      return true;
+
+    return true;
   }
 
 
@@ -496,15 +529,13 @@ bool AArch64InstructionSelector::select(MachineInstr &I) const {
     return false;
   }
 
+  if (selectImpl(I))
+    return true;
+
   LLT Ty =
       I.getOperand(0).isReg() ? MRI.getType(I.getOperand(0).getReg()) : LLT{};
 
   switch (Opcode) {
-  case TargetOpcode::G_BR: {
-    I.setDesc(TII.get(AArch64::B));
-    return true;
-  }
-
   case TargetOpcode::G_BRCOND: {
     if (Ty.getSizeInBits() > 32) {
       // We shouldn't need this on AArch64, but it would be implemented as an
@@ -598,6 +629,9 @@ bool AArch64InstructionSelector::select(MachineInstr &I) const {
       // FIXME: Is going through int64_t always correct?
       ImmOp.ChangeToImmediate(
           ImmOp.getFPImm()->getValueAPF().bitcastToAPInt().getZExtValue());
+    } else {
+      uint64_t Val = I.getOperand(1).getCImm()->getZExtValue();
+      I.getOperand(1).ChangeToImmediate(Val);
     }
 
     constrainSelectedInstRegOperands(I, TII, TRI, RBI);
@@ -628,9 +662,10 @@ bool AArch64InstructionSelector::select(MachineInstr &I) const {
       return false;
     }
     unsigned char OpFlags = STI.ClassifyGlobalReference(GV, TM);
-    if (OpFlags & AArch64II::MO_GOT)
+    if (OpFlags & AArch64II::MO_GOT) {
       I.setDesc(TII.get(AArch64::LOADgot));
-    else {
+      I.getOperand(1).setTargetFlags(OpFlags);
+    } else {
       I.setDesc(TII.get(AArch64::MOVaddr));
       I.getOperand(1).setTargetFlags(OpFlags | AArch64II::MO_PAGE);
       MachineInstrBuilder MIB(MF, I);
@@ -884,7 +919,7 @@ bool AArch64InstructionSelector::select(MachineInstr &I) const {
                  .addUse(SrcXReg)
                  .addImm(0)
                  .addImm(SrcTy.getSizeInBits() - 1);
-    } else if (DstTy == LLT::scalar(32)) {
+    } else if (DstTy.isScalar() && DstTy.getSizeInBits() <= 32) {
       const unsigned NewOpc = isSigned ? AArch64::SBFMWri : AArch64::UBFMWri;
       ExtI = BuildMI(MBB, I, I.getDebugLoc(), TII.get(NewOpc))
                  .addDef(DefReg)
@@ -922,6 +957,99 @@ bool AArch64InstructionSelector::select(MachineInstr &I) const {
   case TargetOpcode::G_BITCAST:
     return selectCopy(I, TII, MRI, TRI, RBI);
 
+  case TargetOpcode::G_FPEXT: {
+    if (MRI.getType(I.getOperand(0).getReg()) != LLT::scalar(64)) {
+      DEBUG(dbgs() << "G_FPEXT to type " << Ty
+                   << ", expected: " << LLT::scalar(64) << '\n');
+      return false;
+    }
+
+    if (MRI.getType(I.getOperand(1).getReg()) != LLT::scalar(32)) {
+      DEBUG(dbgs() << "G_FPEXT from type " << Ty
+                   << ", expected: " << LLT::scalar(32) << '\n');
+      return false;
+    }
+
+    const unsigned DefReg = I.getOperand(0).getReg();
+    const RegisterBank &RB = *RBI.getRegBank(DefReg, MRI, TRI);
+
+    if (RB.getID() != AArch64::FPRRegBankID) {
+      DEBUG(dbgs() << "G_FPEXT on bank: " << RB << ", expected: FPR\n");
+      return false;
+    }
+
+    I.setDesc(TII.get(AArch64::FCVTDSr));
+    constrainSelectedInstRegOperands(I, TII, TRI, RBI);
+
+    return true;
+  }
+
+  case TargetOpcode::G_FPTRUNC: {
+    if (MRI.getType(I.getOperand(0).getReg()) != LLT::scalar(32)) {
+      DEBUG(dbgs() << "G_FPTRUNC to type " << Ty
+                   << ", expected: " << LLT::scalar(32) << '\n');
+      return false;
+    }
+
+    if (MRI.getType(I.getOperand(1).getReg()) != LLT::scalar(64)) {
+      DEBUG(dbgs() << "G_FPTRUNC from type " << Ty
+                   << ", expected: " << LLT::scalar(64) << '\n');
+      return false;
+    }
+
+    const unsigned DefReg = I.getOperand(0).getReg();
+    const RegisterBank &RB = *RBI.getRegBank(DefReg, MRI, TRI);
+
+    if (RB.getID() != AArch64::FPRRegBankID) {
+      DEBUG(dbgs() << "G_FPTRUNC on bank: " << RB << ", expected: FPR\n");
+      return false;
+    }
+
+    I.setDesc(TII.get(AArch64::FCVTSDr));
+    constrainSelectedInstRegOperands(I, TII, TRI, RBI);
+
+    return true;
+  }
+
+  case TargetOpcode::G_SELECT: {
+    if (MRI.getType(I.getOperand(1).getReg()) != LLT::scalar(1)) {
+      DEBUG(dbgs() << "G_SELECT cond has type: " << Ty
+                   << ", expected: " << LLT::scalar(1) << '\n');
+      return false;
+    }
+
+    const unsigned CondReg = I.getOperand(1).getReg();
+    const unsigned TReg = I.getOperand(2).getReg();
+    const unsigned FReg = I.getOperand(3).getReg();
+
+    unsigned CSelOpc = 0;
+
+    if (Ty == LLT::scalar(32)) {
+      CSelOpc = AArch64::CSELWr;
+    } else if (Ty == LLT::scalar(64)) {
+      CSelOpc = AArch64::CSELXr;
+    } else {
+      return false;
+    }
+
+    MachineInstr &TstMI =
+        *BuildMI(MBB, I, I.getDebugLoc(), TII.get(AArch64::ANDSWri))
+             .addDef(AArch64::WZR)
+             .addUse(CondReg)
+             .addImm(AArch64_AM::encodeLogicalImmediate(1, 32));
+
+    MachineInstr &CSelMI = *BuildMI(MBB, I, I.getDebugLoc(), TII.get(CSelOpc))
+                                .addDef(I.getOperand(0).getReg())
+                                .addUse(TReg)
+                                .addUse(FReg)
+                                .addImm(AArch64CC::NE);
+
+    constrainSelectedInstRegOperands(TstMI, TII, TRI, RBI);
+    constrainSelectedInstRegOperands(CSelMI, TII, TRI, RBI);
+
+    I.eraseFromParent();
+    return true;
+  }
   case TargetOpcode::G_ICMP: {
     if (Ty != LLT::scalar(1)) {
       DEBUG(dbgs() << "G_ICMP result has type: " << Ty
@@ -943,8 +1071,12 @@ bool AArch64InstructionSelector::select(MachineInstr &I) const {
       return false;
     }
 
-    const AArch64CC::CondCode CC = changeICMPPredToAArch64CC(
-        (CmpInst::Predicate)I.getOperand(1).getPredicate());
+    // CSINC increments the result by one when the condition code is false.
+    // Therefore, we have to invert the predicate to get an increment by 1 when
+    // the predicate is true.
+    const AArch64CC::CondCode invCC =
+        changeICMPPredToAArch64CC(CmpInst::getInversePredicate(
+            (CmpInst::Predicate)I.getOperand(1).getPredicate()));
 
     MachineInstr &CmpMI = *BuildMI(MBB, I, I.getDebugLoc(), TII.get(CmpOpc))
                                .addDef(ZReg)
@@ -956,7 +1088,7 @@ bool AArch64InstructionSelector::select(MachineInstr &I) const {
              .addDef(I.getOperand(0).getReg())
              .addUse(AArch64::WZR)
              .addUse(AArch64::WZR)
-             .addImm(CC);
+             .addImm(invCC);
 
     constrainSelectedInstRegOperands(CmpMI, TII, TRI, RBI);
     constrainSelectedInstRegOperands(CSetMI, TII, TRI, RBI);

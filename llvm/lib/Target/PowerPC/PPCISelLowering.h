@@ -47,7 +47,7 @@ namespace llvm {
       FCTIDZ, FCTIWZ,
 
       /// Newer FCTI[D,W]UZ floating-point-to-integer conversion instructions for
-      /// unsigned integers.
+      /// unsigned integers with round toward zero.
       FCTIDUZ, FCTIWUZ,
 
       /// VEXTS, ByteWidth - takes an input in VSFRC and produces an output in
@@ -770,6 +770,15 @@ namespace llvm {
     void insertSSPDeclarations(Module &M) const override;
 
     bool isFPImmLegal(const APFloat &Imm, EVT VT) const override;
+
+    unsigned getJumpTableEncoding() const override;
+    bool isJumpTableRelative() const override;
+    SDValue getPICJumpTableRelocBase(SDValue Table,
+                                     SelectionDAG &DAG) const override;
+    const MCExpr *getPICJumpTableRelocBaseExpr(const MachineFunction *MF,
+                                               unsigned JTI,
+                                               MCContext &Ctx) const override;
+
   private:
     struct ReuseLoadInfo {
       SDValue Ptr;
@@ -806,6 +815,8 @@ namespace llvm {
                                 SelectionDAG &DAG, const SDLoc &dl) const;
     SDValue LowerFP_TO_INTDirectMove(SDValue Op, SelectionDAG &DAG,
                                      const SDLoc &dl) const;
+
+    bool directMoveIsProfitable(const SDValue &Op) const;
     SDValue LowerINT_TO_FPDirectMove(SDValue Op, SelectionDAG &DAG,
                                      const SDLoc &dl) const;
 
@@ -968,14 +979,23 @@ namespace llvm {
     SDValue DAGCombineTruncBoolExt(SDNode *N, DAGCombinerInfo &DCI) const;
     SDValue combineFPToIntToFP(SDNode *N, DAGCombinerInfo &DCI) const;
 
-    SDValue getRsqrtEstimate(SDValue Operand, SelectionDAG &DAG, int Enabled,
-                             int &RefinementSteps,
-                             bool &UseOneConstNR) const override;
+    /// ConvertSETCCToSubtract - looks at SETCC that compares ints. It replaces
+    /// SETCC with integer subtraction when (1) there is a legal way of doing it
+    /// (2) keeping the result of comparison in GPR has performance benefit.
+    SDValue ConvertSETCCToSubtract(SDNode *N, DAGCombinerInfo &DCI) const;
+
+    SDValue getSqrtEstimate(SDValue Operand, SelectionDAG &DAG, int Enabled,
+                            int &RefinementSteps, bool &UseOneConstNR,
+                            bool Reciprocal) const override;
     SDValue getRecipEstimate(SDValue Operand, SelectionDAG &DAG, int Enabled,
                              int &RefinementSteps) const override;
     unsigned combineRepeatedFPDivisors() const override;
 
     CCAssignFn *useFastISelCCs(unsigned Flag) const;
+
+    SDValue
+      combineElementTruncationToVectorTruncation(SDNode *N,
+                                                 DAGCombinerInfo &DCI) const;
   };
 
   namespace PPC {

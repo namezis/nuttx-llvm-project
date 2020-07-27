@@ -14,8 +14,10 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/GlobalISel/CallLowering.h"
+#include "llvm/CodeGen/Analysis.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
+#include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/IR/Constant.h"
@@ -37,6 +39,13 @@ INITIALIZE_PASS_BEGIN(IRTranslator, DEBUG_TYPE, "IRTranslator LLVM IR -> MI",
 INITIALIZE_PASS_DEPENDENCY(TargetPassConfig)
 INITIALIZE_PASS_END(IRTranslator, DEBUG_TYPE, "IRTranslator LLVM IR -> MI",
                 false, false)
+
+static void reportTranslationError(const Value &V, const Twine &Message) {
+  std::string ErrStorage;
+  raw_string_ostream Err(ErrStorage);
+  Err << Message << ": " << V << '\n';
+  report_fatal_error(Err.str());
+}
 
 IRTranslator::IRTranslator() : MachineFunctionPass(ID), MRI(nullptr) {
   initializeIRTranslatorPass(*PassRegistry::getPassRegistry());
@@ -63,11 +72,11 @@ unsigned IRTranslator::getOrCreateVReg(const Value &Val) {
       bool Success = translate(*CV, VReg);
       if (!Success) {
         if (!TPC->isGlobalISelAbortEnabled()) {
-          MIRBuilder.getMF().getProperties().set(
+          MF->getProperties().set(
               MachineFunctionProperties::Property::FailedISel);
-          return 0;
+          return VReg;
         }
-        report_fatal_error("unable to translate constant");
+        reportTranslationError(Val, "unable to translate constant");
       }
     }
   }
@@ -78,7 +87,6 @@ int IRTranslator::getOrCreateFrameIndex(const AllocaInst &AI) {
   if (FrameIndices.find(&AI) != FrameIndices.end())
     return FrameIndices[&AI];
 
-  MachineFunction &MF = MIRBuilder.getMF();
   unsigned ElementSize = DL->getTypeStoreSize(AI.getAllocatedType());
   unsigned Size =
       ElementSize * cast<ConstantInt>(AI.getArraySize())->getZExtValue();
@@ -91,7 +99,7 @@ int IRTranslator::getOrCreateFrameIndex(const AllocaInst &AI) {
     Alignment = DL->getABITypeAlignment(AI.getAllocatedType());
 
   int &FI = FrameIndices[&AI];
-  FI = MF.getFrameInfo().CreateStackObject(Size, Alignment, false, &AI);
+  FI = MF->getFrameInfo().CreateStackObject(Size, Alignment, false, &AI);
   return FI;
 }
 
@@ -105,7 +113,7 @@ unsigned IRTranslator::getMemOpAlignment(const Instruction &I) {
     Alignment = LI->getAlignment();
     ValTy = LI->getType();
   } else if (!TPC->isGlobalISelAbortEnabled()) {
-    MIRBuilder.getMF().getProperties().set(
+    MF->getProperties().set(
         MachineFunctionProperties::Property::FailedISel);
     return 1;
   } else
@@ -117,14 +125,17 @@ unsigned IRTranslator::getMemOpAlignment(const Instruction &I) {
 MachineBasicBlock &IRTranslator::getOrCreateBB(const BasicBlock &BB) {
   MachineBasicBlock *&MBB = BBToMBB[&BB];
   if (!MBB) {
-    MachineFunction &MF = MIRBuilder.getMF();
-    MBB = MF.CreateMachineBasicBlock();
-    MF.push_back(MBB);
+    MBB = MF->CreateMachineBasicBlock(&BB);
+    MF->push_back(MBB);
+
+    if (BB.hasAddressTaken())
+      MBB->setHasAddressTaken();
   }
   return *MBB;
 }
 
-bool IRTranslator::translateBinaryOp(unsigned Opcode, const User &U) {
+bool IRTranslator::translateBinaryOp(unsigned Opcode, const User &U,
+                                     MachineIRBuilder &MIRBuilder) {
   // FIXME: handle signed/unsigned wrapping flags.
 
   // Get or create a virtual register for each value.
@@ -138,7 +149,8 @@ bool IRTranslator::translateBinaryOp(unsigned Opcode, const User &U) {
   return true;
 }
 
-bool IRTranslator::translateCompare(const User &U) {
+bool IRTranslator::translateCompare(const User &U,
+                                    MachineIRBuilder &MIRBuilder) {
   const CmpInst *CI = dyn_cast<CmpInst>(&U);
   unsigned Op0 = getOrCreateVReg(*U.getOperand(0));
   unsigned Op1 = getOrCreateVReg(*U.getOperand(1));
@@ -155,7 +167,7 @@ bool IRTranslator::translateCompare(const User &U) {
   return true;
 }
 
-bool IRTranslator::translateRet(const User &U) {
+bool IRTranslator::translateRet(const User &U, MachineIRBuilder &MIRBuilder) {
   const ReturnInst &RI = cast<ReturnInst>(U);
   const Value *Ret = RI.getReturnValue();
   // The target may mess up with the insertion point, but
@@ -164,7 +176,7 @@ bool IRTranslator::translateRet(const User &U) {
   return CLI->lowerReturn(MIRBuilder, Ret, !Ret ? 0 : getOrCreateVReg(*Ret));
 }
 
-bool IRTranslator::translateBr(const User &U) {
+bool IRTranslator::translateBr(const User &U, MachineIRBuilder &MIRBuilder) {
   const BranchInst &BrInst = cast<BranchInst>(U);
   unsigned Succ = 0;
   if (!BrInst.isUnconditional()) {
@@ -186,7 +198,46 @@ bool IRTranslator::translateBr(const User &U) {
   return true;
 }
 
-bool IRTranslator::translateLoad(const User &U) {
+bool IRTranslator::translateSwitch(const User &U,
+                                   MachineIRBuilder &MIRBuilder) {
+  // For now, just translate as a chain of conditional branches.
+  // FIXME: could we share most of the logic/code in
+  // SelectionDAGBuilder::visitSwitch between SelectionDAG and GlobalISel?
+  // At first sight, it seems most of the logic in there is independent of
+  // SelectionDAG-specifics and a lot of work went in to optimize switch
+  // lowering in there.
+
+  const SwitchInst &SwInst = cast<SwitchInst>(U);
+  const unsigned SwCondValue = getOrCreateVReg(*SwInst.getCondition());
+
+  LLT LLTi1 = LLT(*Type::getInt1Ty(U.getContext()), *DL);
+  for (auto &CaseIt : SwInst.cases()) {
+    const unsigned CaseValueReg = getOrCreateVReg(*CaseIt.getCaseValue());
+    const unsigned Tst = MRI->createGenericVirtualRegister(LLTi1);
+    MIRBuilder.buildICmp(CmpInst::ICMP_EQ, Tst, CaseValueReg, SwCondValue);
+    MachineBasicBlock &CurBB = MIRBuilder.getMBB();
+    MachineBasicBlock &TrueBB = getOrCreateBB(*CaseIt.getCaseSuccessor());
+
+    MIRBuilder.buildBrCond(Tst, TrueBB);
+    CurBB.addSuccessor(&TrueBB);
+
+    MachineBasicBlock *FalseBB =
+        MF->CreateMachineBasicBlock(SwInst.getParent());
+    MF->push_back(FalseBB);
+    MIRBuilder.buildBr(*FalseBB);
+    CurBB.addSuccessor(FalseBB);
+
+    MIRBuilder.setMBB(*FalseBB);
+  }
+  // handle default case
+  MachineBasicBlock &DefaultBB = getOrCreateBB(*SwInst.getDefaultDest());
+  MIRBuilder.buildBr(DefaultBB);
+  MIRBuilder.getMBB().addSuccessor(&DefaultBB);
+
+  return true;
+}
+
+bool IRTranslator::translateLoad(const User &U, MachineIRBuilder &MIRBuilder) {
   const LoadInst &LI = cast<LoadInst>(U);
 
   if (!TPC->isGlobalISelAbortEnabled() && LI.isAtomic())
@@ -197,19 +248,18 @@ bool IRTranslator::translateLoad(const User &U) {
                                : MachineMemOperand::MONone;
   Flags |= MachineMemOperand::MOLoad;
 
-  MachineFunction &MF = MIRBuilder.getMF();
   unsigned Res = getOrCreateVReg(LI);
   unsigned Addr = getOrCreateVReg(*LI.getPointerOperand());
   LLT VTy{*LI.getType(), *DL}, PTy{*LI.getPointerOperand()->getType(), *DL};
   MIRBuilder.buildLoad(
       Res, Addr,
-      *MF.getMachineMemOperand(MachinePointerInfo(LI.getPointerOperand()),
-                               Flags, DL->getTypeStoreSize(LI.getType()),
-                               getMemOpAlignment(LI)));
+      *MF->getMachineMemOperand(MachinePointerInfo(LI.getPointerOperand()),
+                                Flags, DL->getTypeStoreSize(LI.getType()),
+                                getMemOpAlignment(LI)));
   return true;
 }
 
-bool IRTranslator::translateStore(const User &U) {
+bool IRTranslator::translateStore(const User &U, MachineIRBuilder &MIRBuilder) {
   const StoreInst &SI = cast<StoreInst>(U);
 
   if (!TPC->isGlobalISelAbortEnabled() && SI.isAtomic())
@@ -220,21 +270,22 @@ bool IRTranslator::translateStore(const User &U) {
                                : MachineMemOperand::MONone;
   Flags |= MachineMemOperand::MOStore;
 
-  MachineFunction &MF = MIRBuilder.getMF();
   unsigned Val = getOrCreateVReg(*SI.getValueOperand());
   unsigned Addr = getOrCreateVReg(*SI.getPointerOperand());
   LLT VTy{*SI.getValueOperand()->getType(), *DL},
       PTy{*SI.getPointerOperand()->getType(), *DL};
 
   MIRBuilder.buildStore(
-      Val, Addr, *MF.getMachineMemOperand(
-                     MachinePointerInfo(SI.getPointerOperand()), Flags,
-                     DL->getTypeStoreSize(SI.getValueOperand()->getType()),
-                     getMemOpAlignment(SI)));
+      Val, Addr,
+      *MF->getMachineMemOperand(
+          MachinePointerInfo(SI.getPointerOperand()), Flags,
+          DL->getTypeStoreSize(SI.getValueOperand()->getType()),
+          getMemOpAlignment(SI)));
   return true;
 }
 
-bool IRTranslator::translateExtractValue(const User &U) {
+bool IRTranslator::translateExtractValue(const User &U,
+                                         MachineIRBuilder &MIRBuilder) {
   const Value *Src = U.getOperand(0);
   Type *Int32Ty = Type::getInt32Ty(U.getContext());
   SmallVector<Value *, 1> Indices;
@@ -259,7 +310,8 @@ bool IRTranslator::translateExtractValue(const User &U) {
   return true;
 }
 
-bool IRTranslator::translateInsertValue(const User &U) {
+bool IRTranslator::translateInsertValue(const User &U,
+                                        MachineIRBuilder &MIRBuilder) {
   const Value *Src = U.getOperand(0);
   Type *Int32Ty = Type::getInt32Ty(U.getContext());
   SmallVector<Value *, 1> Indices;
@@ -286,14 +338,16 @@ bool IRTranslator::translateInsertValue(const User &U) {
   return true;
 }
 
-bool IRTranslator::translateSelect(const User &U) {
+bool IRTranslator::translateSelect(const User &U,
+                                   MachineIRBuilder &MIRBuilder) {
   MIRBuilder.buildSelect(getOrCreateVReg(U), getOrCreateVReg(*U.getOperand(0)),
                          getOrCreateVReg(*U.getOperand(1)),
                          getOrCreateVReg(*U.getOperand(2)));
   return true;
 }
 
-bool IRTranslator::translateBitCast(const User &U) {
+bool IRTranslator::translateBitCast(const User &U,
+                                    MachineIRBuilder &MIRBuilder) {
   if (LLT{*U.getOperand(0)->getType(), *DL} == LLT{*U.getType(), *DL}) {
     unsigned &Reg = ValToVReg[&U];
     if (Reg)
@@ -302,17 +356,19 @@ bool IRTranslator::translateBitCast(const User &U) {
       Reg = getOrCreateVReg(*U.getOperand(0));
     return true;
   }
-  return translateCast(TargetOpcode::G_BITCAST, U);
+  return translateCast(TargetOpcode::G_BITCAST, U, MIRBuilder);
 }
 
-bool IRTranslator::translateCast(unsigned Opcode, const User &U) {
+bool IRTranslator::translateCast(unsigned Opcode, const User &U,
+                                 MachineIRBuilder &MIRBuilder) {
   unsigned Op = getOrCreateVReg(*U.getOperand(0));
   unsigned Res = getOrCreateVReg(U);
   MIRBuilder.buildInstr(Opcode).addDef(Res).addUse(Op);
   return true;
 }
 
-bool IRTranslator::translateGetElementPtr(const User &U) {
+bool IRTranslator::translateGetElementPtr(const User &U,
+                                          MachineIRBuilder &MIRBuilder) {
   // FIXME: support vector GEPs.
   if (U.getType()->isVectorTy())
     return false;
@@ -327,7 +383,7 @@ bool IRTranslator::translateGetElementPtr(const User &U) {
   for (gep_type_iterator GTI = gep_type_begin(&U), E = gep_type_end(&U);
        GTI != E; ++GTI) {
     const Value *Idx = GTI.getOperand();
-    if (StructType *StTy = dyn_cast<StructType>(*GTI)) {
+    if (StructType *StTy = GTI.getStructTypeOrNull()) {
       unsigned Field = cast<Constant>(Idx)->getUniqueInteger().getZExtValue();
       Offset += DL->getStructLayout(StTy)->getElementOffset(Field);
       continue;
@@ -382,7 +438,8 @@ bool IRTranslator::translateGetElementPtr(const User &U) {
   return true;
 }
 
-bool IRTranslator::translateMemcpy(const CallInst &CI) {
+bool IRTranslator::translateMemcpy(const CallInst &CI,
+                                   MachineIRBuilder &MIRBuilder) {
   LLT SizeTy{*CI.getArgOperand(2)->getType(), *DL};
   if (cast<PointerType>(CI.getArgOperand(0)->getType())->getAddressSpace() !=
           0 ||
@@ -403,66 +460,28 @@ bool IRTranslator::translateMemcpy(const CallInst &CI) {
                         CallLowering::ArgInfo(0, CI.getType()), Args);
 }
 
-void IRTranslator::getStackGuard(unsigned DstReg) {
+void IRTranslator::getStackGuard(unsigned DstReg,
+                                 MachineIRBuilder &MIRBuilder) {
   auto MIB = MIRBuilder.buildInstr(TargetOpcode::LOAD_STACK_GUARD);
   MIB.addDef(DstReg);
 
-  auto &MF = MIRBuilder.getMF();
-  auto &TLI = *MF.getSubtarget().getTargetLowering();
-  Value *Global = TLI.getSDagStackGuard(*MF.getFunction()->getParent());
+  auto &TLI = *MF->getSubtarget().getTargetLowering();
+  Value *Global = TLI.getSDagStackGuard(*MF->getFunction()->getParent());
   if (!Global)
     return;
 
   MachinePointerInfo MPInfo(Global);
-  MachineInstr::mmo_iterator MemRefs = MF.allocateMemRefsArray(1);
+  MachineInstr::mmo_iterator MemRefs = MF->allocateMemRefsArray(1);
   auto Flags = MachineMemOperand::MOLoad | MachineMemOperand::MOInvariant |
                MachineMemOperand::MODereferenceable;
   *MemRefs =
-      MF.getMachineMemOperand(MPInfo, Flags, DL->getPointerSizeInBits() / 8,
-                              DL->getPointerABIAlignment());
+      MF->getMachineMemOperand(MPInfo, Flags, DL->getPointerSizeInBits() / 8,
+                               DL->getPointerABIAlignment());
   MIB.setMemRefs(MemRefs, MemRefs + 1);
 }
 
-bool IRTranslator::translateKnownIntrinsic(const CallInst &CI,
-                                           Intrinsic::ID ID) {
-  unsigned Op = 0;
-  switch (ID) {
-  default: return false;
-  case Intrinsic::uadd_with_overflow: Op = TargetOpcode::G_UADDE; break;
-  case Intrinsic::sadd_with_overflow: Op = TargetOpcode::G_SADDO; break;
-  case Intrinsic::usub_with_overflow: Op = TargetOpcode::G_USUBE; break;
-  case Intrinsic::ssub_with_overflow: Op = TargetOpcode::G_SSUBO; break;
-  case Intrinsic::umul_with_overflow: Op = TargetOpcode::G_UMULO; break;
-  case Intrinsic::smul_with_overflow: Op = TargetOpcode::G_SMULO; break;
-  case Intrinsic::memcpy:
-    return translateMemcpy(CI);
-  case Intrinsic::objectsize: {
-    // If we don't know by now, we're never going to know.
-    const ConstantInt *Min = cast<ConstantInt>(CI.getArgOperand(1));
-
-    MIRBuilder.buildConstant(getOrCreateVReg(CI), Min->isZero() ? -1ULL : 0);
-    return true;
-  }
-  case Intrinsic::stackguard:
-    getStackGuard(getOrCreateVReg(CI));
-    return true;
-  case Intrinsic::stackprotector: {
-    MachineFunction &MF = MIRBuilder.getMF();
-    LLT PtrTy{*CI.getArgOperand(0)->getType(), *DL};
-    unsigned GuardVal = MRI->createGenericVirtualRegister(PtrTy);
-    getStackGuard(GuardVal);
-
-    AllocaInst *Slot = cast<AllocaInst>(CI.getArgOperand(1));
-    MIRBuilder.buildStore(
-        GuardVal, getOrCreateVReg(*Slot),
-        *MF.getMachineMemOperand(
-            MachinePointerInfo::getFixedStack(MF, getOrCreateFrameIndex(*Slot)),
-            MachineMemOperand::MOStore | MachineMemOperand::MOVolatile,
-            PtrTy.getSizeInBits() / 8, 8));
-    return true;
-  }
-  }
-
+bool IRTranslator::translateOverflowIntrinsic(const CallInst &CI, unsigned Op,
+                                              MachineIRBuilder &MIRBuilder) {
   LLT Ty{*CI.getOperand(0)->getType(), *DL};
   LLT s1 = LLT::scalar(1);
   unsigned Width = Ty.getSizeInBits();
@@ -484,9 +503,70 @@ bool IRTranslator::translateKnownIntrinsic(const CallInst &CI,
   return true;
 }
 
-bool IRTranslator::translateCall(const User &U) {
+bool IRTranslator::translateKnownIntrinsic(const CallInst &CI, Intrinsic::ID ID,
+                                           MachineIRBuilder &MIRBuilder) {
+  switch (ID) {
+  default:
+    break;
+  case Intrinsic::dbg_declare:
+  case Intrinsic::dbg_value:
+    // FIXME: these obviously need to be supported properly.
+    MF->getProperties().set(
+          MachineFunctionProperties::Property::FailedISel);
+    return true;
+  case Intrinsic::uadd_with_overflow:
+    return translateOverflowIntrinsic(CI, TargetOpcode::G_UADDE, MIRBuilder);
+  case Intrinsic::sadd_with_overflow:
+    return translateOverflowIntrinsic(CI, TargetOpcode::G_SADDO, MIRBuilder);
+  case Intrinsic::usub_with_overflow:
+    return translateOverflowIntrinsic(CI, TargetOpcode::G_USUBE, MIRBuilder);
+  case Intrinsic::ssub_with_overflow:
+    return translateOverflowIntrinsic(CI, TargetOpcode::G_SSUBO, MIRBuilder);
+  case Intrinsic::umul_with_overflow:
+    return translateOverflowIntrinsic(CI, TargetOpcode::G_UMULO, MIRBuilder);
+  case Intrinsic::smul_with_overflow:
+    return translateOverflowIntrinsic(CI, TargetOpcode::G_SMULO, MIRBuilder);
+  case Intrinsic::memcpy:
+    return translateMemcpy(CI, MIRBuilder);
+  case Intrinsic::eh_typeid_for: {
+    GlobalValue *GV = ExtractTypeInfo(CI.getArgOperand(0));
+    unsigned Reg = getOrCreateVReg(CI);
+    unsigned TypeID = MF->getTypeIDFor(GV);
+    MIRBuilder.buildConstant(Reg, TypeID);
+    return true;
+  }
+  case Intrinsic::objectsize: {
+    // If we don't know by now, we're never going to know.
+    const ConstantInt *Min = cast<ConstantInt>(CI.getArgOperand(1));
+
+    MIRBuilder.buildConstant(getOrCreateVReg(CI), Min->isZero() ? -1ULL : 0);
+    return true;
+  }
+  case Intrinsic::stackguard:
+    getStackGuard(getOrCreateVReg(CI), MIRBuilder);
+    return true;
+  case Intrinsic::stackprotector: {
+    LLT PtrTy{*CI.getArgOperand(0)->getType(), *DL};
+    unsigned GuardVal = MRI->createGenericVirtualRegister(PtrTy);
+    getStackGuard(GuardVal, MIRBuilder);
+
+    AllocaInst *Slot = cast<AllocaInst>(CI.getArgOperand(1));
+    MIRBuilder.buildStore(
+        GuardVal, getOrCreateVReg(*Slot),
+        *MF->getMachineMemOperand(
+            MachinePointerInfo::getFixedStack(*MF,
+                                              getOrCreateFrameIndex(*Slot)),
+            MachineMemOperand::MOStore | MachineMemOperand::MOVolatile,
+            PtrTy.getSizeInBits() / 8, 8));
+    return true;
+  }
+  }
+  return false;
+}
+
+bool IRTranslator::translateCall(const User &U, MachineIRBuilder &MIRBuilder) {
   const CallInst &CI = cast<CallInst>(U);
-  auto TII = MIRBuilder.getMF().getTarget().getIntrinsicInfo();
+  auto TII = MF->getTarget().getIntrinsicInfo();
   const Function *F = CI.getCalledFunction();
 
   if (!F || !F->isIntrinsic()) {
@@ -506,7 +586,7 @@ bool IRTranslator::translateCall(const User &U) {
 
   assert(ID != Intrinsic::not_intrinsic && "unknown intrinsic");
 
-  if (translateKnownIntrinsic(CI, ID))
+  if (translateKnownIntrinsic(CI, ID, MIRBuilder))
     return true;
 
   unsigned Res = CI.getType()->isVoidTy() ? 0 : getOrCreateVReg(CI);
@@ -522,7 +602,112 @@ bool IRTranslator::translateCall(const User &U) {
   return true;
 }
 
-bool IRTranslator::translateStaticAlloca(const AllocaInst &AI) {
+bool IRTranslator::translateInvoke(const User &U,
+                                   MachineIRBuilder &MIRBuilder) {
+  const InvokeInst &I = cast<InvokeInst>(U);
+  MCContext &Context = MF->getContext();
+
+  const BasicBlock *ReturnBB = I.getSuccessor(0);
+  const BasicBlock *EHPadBB = I.getSuccessor(1);
+
+  const Value *Callee(I.getCalledValue());
+  const Function *Fn = dyn_cast<Function>(Callee);
+  if (isa<InlineAsm>(Callee))
+    return false;
+
+  // FIXME: support invoking patchpoint and statepoint intrinsics.
+  if (Fn && Fn->isIntrinsic())
+    return false;
+
+  // FIXME: support whatever these are.
+  if (I.countOperandBundlesOfType(LLVMContext::OB_deopt))
+    return false;
+
+  // FIXME: support Windows exception handling.
+  if (!isa<LandingPadInst>(EHPadBB->front()))
+    return false;
+
+
+  // Emit the actual call, bracketed by EH_LABELs so that the MF knows about
+  // the region covered by the try.
+  MCSymbol *BeginSymbol = Context.createTempSymbol();
+  MIRBuilder.buildInstr(TargetOpcode::EH_LABEL).addSym(BeginSymbol);
+
+  unsigned Res = I.getType()->isVoidTy() ? 0 : getOrCreateVReg(I);
+  SmallVector<CallLowering::ArgInfo, 8> Args;
+  for (auto &Arg: I.arg_operands())
+    Args.emplace_back(getOrCreateVReg(*Arg), Arg->getType());
+
+  if (!CLI->lowerCall(MIRBuilder, MachineOperand::CreateGA(Fn, 0),
+                      CallLowering::ArgInfo(Res, I.getType()), Args))
+    return false;
+
+  MCSymbol *EndSymbol = Context.createTempSymbol();
+  MIRBuilder.buildInstr(TargetOpcode::EH_LABEL).addSym(EndSymbol);
+
+  // FIXME: track probabilities.
+  MachineBasicBlock &EHPadMBB = getOrCreateBB(*EHPadBB),
+                    &ReturnMBB = getOrCreateBB(*ReturnBB);
+  MF->addInvoke(&EHPadMBB, BeginSymbol, EndSymbol);
+  MIRBuilder.getMBB().addSuccessor(&ReturnMBB);
+  MIRBuilder.getMBB().addSuccessor(&EHPadMBB);
+
+  return true;
+}
+
+bool IRTranslator::translateLandingPad(const User &U,
+                                       MachineIRBuilder &MIRBuilder) {
+  const LandingPadInst &LP = cast<LandingPadInst>(U);
+
+  MachineBasicBlock &MBB = MIRBuilder.getMBB();
+  addLandingPadInfo(LP, MBB);
+
+  MBB.setIsEHPad();
+
+  // If there aren't registers to copy the values into (e.g., during SjLj
+  // exceptions), then don't bother.
+  auto &TLI = *MF->getSubtarget().getTargetLowering();
+  const Constant *PersonalityFn = MF->getFunction()->getPersonalityFn();
+  if (TLI.getExceptionPointerRegister(PersonalityFn) == 0 &&
+      TLI.getExceptionSelectorRegister(PersonalityFn) == 0)
+    return true;
+
+  // If landingpad's return type is token type, we don't create DAG nodes
+  // for its exception pointer and selector value. The extraction of exception
+  // pointer or selector value from token type landingpads is not currently
+  // supported.
+  if (LP.getType()->isTokenTy())
+    return true;
+
+  // Add a label to mark the beginning of the landing pad.  Deletion of the
+  // landing pad can thus be detected via the MachineModuleInfo.
+  MIRBuilder.buildInstr(TargetOpcode::EH_LABEL)
+    .addSym(MF->addLandingPad(&MBB));
+
+  // Mark exception register as live in.
+  SmallVector<unsigned, 2> Regs;
+  SmallVector<uint64_t, 2> Offsets;
+  LLT p0 = LLT::pointer(0, DL->getPointerSizeInBits());
+  if (unsigned Reg = TLI.getExceptionPointerRegister(PersonalityFn)) {
+    unsigned VReg = MRI->createGenericVirtualRegister(p0);
+    MIRBuilder.buildCopy(VReg, Reg);
+    Regs.push_back(VReg);
+    Offsets.push_back(0);
+  }
+
+  if (unsigned Reg = TLI.getExceptionSelectorRegister(PersonalityFn)) {
+    unsigned VReg = MRI->createGenericVirtualRegister(p0);
+    MIRBuilder.buildCopy(VReg, Reg);
+    Regs.push_back(VReg);
+    Offsets.push_back(p0.getSizeInBits());
+  }
+
+  MIRBuilder.buildSequence(getOrCreateVReg(LP), Regs, Offsets);
+  return true;
+}
+
+bool IRTranslator::translateStaticAlloca(const AllocaInst &AI,
+                                         MachineIRBuilder &MIRBuilder) {
   if (!TPC->isGlobalISelAbortEnabled() && !AI.isStaticAlloca())
     return false;
 
@@ -533,7 +718,7 @@ bool IRTranslator::translateStaticAlloca(const AllocaInst &AI) {
   return true;
 }
 
-bool IRTranslator::translatePHI(const User &U) {
+bool IRTranslator::translatePHI(const User &U, MachineIRBuilder &MIRBuilder) {
   const PHINode &PI = cast<PHINode>(U);
   auto MIB = MIRBuilder.buildInstr(TargetOpcode::PHI);
   MIB.addDef(getOrCreateVReg(PI));
@@ -545,7 +730,7 @@ bool IRTranslator::translatePHI(const User &U) {
 void IRTranslator::finishPendingPhis() {
   for (std::pair<const PHINode *, MachineInstr *> &Phi : PendingPHIs) {
     const PHINode *PI = Phi.first;
-    MachineInstrBuilder MIB(MIRBuilder.getMF(), Phi.second);
+    MachineInstrBuilder MIB(*MF, Phi.second);
 
     // All MachineBasicBlocks exist, add them to the PHI. We assume IRTranslator
     // won't create extra control flow here, otherwise we need to find the
@@ -558,15 +743,13 @@ void IRTranslator::finishPendingPhis() {
       MIB.addMBB(BBToMBB[PI->getIncomingBlock(i)]);
     }
   }
-
-  PendingPHIs.clear();
 }
 
 bool IRTranslator::translate(const Instruction &Inst) {
-  MIRBuilder.setDebugLoc(Inst.getDebugLoc());
+  CurBuilder.setDebugLoc(Inst.getDebugLoc());
   switch(Inst.getOpcode()) {
 #define HANDLE_INST(NUM, OPCODE, CLASS) \
-    case Instruction::OPCODE: return translate##OPCODE(Inst);
+    case Instruction::OPCODE: return translate##OPCODE(Inst, CurBuilder);
 #include "llvm/IR/Instruction.def"
   default:
     if (!TPC->isGlobalISelAbortEnabled())
@@ -577,21 +760,19 @@ bool IRTranslator::translate(const Instruction &Inst) {
 
 bool IRTranslator::translate(const Constant &C, unsigned Reg) {
   if (auto CI = dyn_cast<ConstantInt>(&C))
-    EntryBuilder.buildConstant(Reg, CI->getZExtValue());
+    EntryBuilder.buildConstant(Reg, *CI);
   else if (auto CF = dyn_cast<ConstantFP>(&C))
     EntryBuilder.buildFConstant(Reg, *CF);
   else if (isa<UndefValue>(C))
     EntryBuilder.buildInstr(TargetOpcode::IMPLICIT_DEF).addDef(Reg);
   else if (isa<ConstantPointerNull>(C))
-    EntryBuilder.buildInstr(TargetOpcode::G_CONSTANT)
-        .addDef(Reg)
-        .addImm(0);
+    EntryBuilder.buildConstant(Reg, 0);
   else if (auto GV = dyn_cast<GlobalValue>(&C))
     EntryBuilder.buildGlobalValue(Reg, GV);
   else if (auto CE = dyn_cast<ConstantExpr>(&C)) {
     switch(CE->getOpcode()) {
 #define HANDLE_INST(NUM, OPCODE, CLASS)                         \
-      case Instruction::OPCODE: return translate##OPCODE(*CE);
+      case Instruction::OPCODE: return translate##OPCODE(*CE, EntryBuilder);
 #include "llvm/IR/Instruction.def"
     default:
       if (!TPC->isGlobalISelAbortEnabled())
@@ -606,75 +787,105 @@ bool IRTranslator::translate(const Constant &C, unsigned Reg) {
   return true;
 }
 
-
 void IRTranslator::finalizeFunction() {
-  finishPendingPhis();
-
   // Release the memory used by the different maps we
   // needed during the translation.
+  PendingPHIs.clear();
   ValToVReg.clear();
   FrameIndices.clear();
   Constants.clear();
 }
 
-bool IRTranslator::runOnMachineFunction(MachineFunction &MF) {
-  const Function &F = *MF.getFunction();
+bool IRTranslator::runOnMachineFunction(MachineFunction &CurMF) {
+  MF = &CurMF;
+  const Function &F = *MF->getFunction();
   if (F.empty())
     return false;
-  CLI = MF.getSubtarget().getCallLowering();
-  MIRBuilder.setMF(MF);
-  EntryBuilder.setMF(MF);
-  MRI = &MF.getRegInfo();
+  CLI = MF->getSubtarget().getCallLowering();
+  CurBuilder.setMF(*MF);
+  EntryBuilder.setMF(*MF);
+  MRI = &MF->getRegInfo();
   DL = &F.getParent()->getDataLayout();
   TPC = &getAnalysis<TargetPassConfig>();
 
   assert(PendingPHIs.empty() && "stale PHIs");
 
-  // Setup the arguments.
-  MachineBasicBlock &MBB = getOrCreateBB(F.front());
-  MIRBuilder.setMBB(MBB);
+  // Setup a separate basic-block for the arguments and constants, falling
+  // through to the IR-level Function's entry block.
+  MachineBasicBlock *EntryBB = MF->CreateMachineBasicBlock();
+  MF->push_back(EntryBB);
+  EntryBB->addSuccessor(&getOrCreateBB(F.front()));
+  EntryBuilder.setMBB(*EntryBB);
+
+  // Lower the actual args into this basic block.
   SmallVector<unsigned, 8> VRegArgs;
   for (const Argument &Arg: F.args())
     VRegArgs.push_back(getOrCreateVReg(Arg));
-  bool Succeeded = CLI->lowerFormalArguments(MIRBuilder, F, VRegArgs);
+  bool Succeeded = CLI->lowerFormalArguments(EntryBuilder, F, VRegArgs);
   if (!Succeeded) {
     if (!TPC->isGlobalISelAbortEnabled()) {
-      MIRBuilder.getMF().getProperties().set(
+      MF->getProperties().set(
           MachineFunctionProperties::Property::FailedISel);
+      finalizeFunction();
       return false;
     }
     report_fatal_error("Unable to lower arguments");
   }
 
-  // Now that we've got the ABI handling code, it's safe to set a location for
-  // any Constants we find in the IR.
-  if (MBB.empty())
-    EntryBuilder.setMBB(MBB);
-  else
-    EntryBuilder.setInstr(MBB.back(), /* Before */ false);
-
+  // And translate the function!
   for (const BasicBlock &BB: F) {
     MachineBasicBlock &MBB = getOrCreateBB(BB);
     // Set the insertion point of all the following translations to
     // the end of this basic block.
-    MIRBuilder.setMBB(MBB);
+    CurBuilder.setMBB(MBB);
+
     for (const Instruction &Inst: BB) {
-      bool Succeeded = translate(Inst);
+      Succeeded &= translate(Inst);
       if (!Succeeded) {
-        DEBUG(dbgs() << "Cannot translate: " << Inst << '\n');
         if (TPC->isGlobalISelAbortEnabled())
-          report_fatal_error("Unable to translate instruction");
-        MF.getProperties().set(MachineFunctionProperties::Property::FailedISel);
+          reportTranslationError(Inst, "unable to translate instruction");
+        MF->getProperties().set(
+            MachineFunctionProperties::Property::FailedISel);
         break;
       }
     }
   }
 
-  finalizeFunction();
+  if (Succeeded) {
+    finishPendingPhis();
 
-  // Now that the MachineFrameInfo has been configured, no further changes to
-  // the reserved registers are possible.
-  MRI->freezeReservedRegs(MF);
+    // Now that the MachineFrameInfo has been configured, no further changes to
+    // the reserved registers are possible.
+    MRI->freezeReservedRegs(*MF);
+
+    // Merge the argument lowering and constants block with its single
+    // successor, the LLVM-IR entry block.  We want the basic block to
+    // be maximal.
+    assert(EntryBB->succ_size() == 1 &&
+           "Custom BB used for lowering should have only one successor");
+    // Get the successor of the current entry block.
+    MachineBasicBlock &NewEntryBB = **EntryBB->succ_begin();
+    assert(NewEntryBB.pred_size() == 1 &&
+           "LLVM-IR entry block has a predecessor!?");
+    // Move all the instruction from the current entry block to the
+    // new entry block.
+    NewEntryBB.splice(NewEntryBB.begin(), EntryBB, EntryBB->begin(),
+                      EntryBB->end());
+
+    // Update the live-in information for the new entry block.
+    for (const MachineBasicBlock::RegisterMaskPair &LiveIn : EntryBB->liveins())
+      NewEntryBB.addLiveIn(LiveIn);
+    NewEntryBB.sortUniqueLiveIns();
+
+    // Get rid of the now empty basic block.
+    EntryBB->removeSuccessor(&NewEntryBB);
+    MF->remove(EntryBB);
+
+    assert(&MF->front() == &NewEntryBB &&
+           "New entry wasn't next in the list of basic block!");
+  }
+
+  finalizeFunction();
 
   return false;
 }

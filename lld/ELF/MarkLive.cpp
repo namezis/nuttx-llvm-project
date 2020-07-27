@@ -80,15 +80,12 @@ static ResolvedReloc<ELFT> resolveReloc(InputSectionBase<ELFT> &Sec,
 template <class ELFT>
 static void forEachSuccessor(InputSection<ELFT> &Sec,
                              std::function<void(ResolvedReloc<ELFT>)> Fn) {
-  ELFFile<ELFT> &Obj = Sec.getFile()->getObj();
-  for (const typename ELFT::Shdr *RelSec : Sec.RelocSections) {
-    if (RelSec->sh_type == SHT_RELA) {
-      for (const typename ELFT::Rela &Rel : Obj.relas(RelSec))
-        Fn(resolveReloc(Sec, Rel));
-    } else {
-      for (const typename ELFT::Rel &Rel : Obj.rels(RelSec))
-        Fn(resolveReloc(Sec, Rel));
-    }
+  if (Sec.AreRelocsRela) {
+    for (const typename ELFT::Rela &Rel : Sec.relas())
+      Fn(resolveReloc(Sec, Rel));
+  } else {
+    for (const typename ELFT::Rel &Rel : Sec.rels())
+      Fn(resolveReloc(Sec, Rel));
   }
   if (Sec.DependentSection)
     Fn({Sec.DependentSection, 0});
@@ -146,18 +143,17 @@ template <class ELFT>
 static void
 scanEhFrameSection(EhInputSection<ELFT> &EH,
                    std::function<void(ResolvedReloc<ELFT>)> Enqueue) {
-  if (!EH.RelocSection)
+  if (!EH.NumRelocations)
     return;
 
   // Unfortunately we need to split .eh_frame early since some relocations in
   // .eh_frame keep other section alive and some don't.
   EH.split();
 
-  ELFFile<ELFT> &EObj = EH.getFile()->getObj();
-  if (EH.RelocSection->sh_type == SHT_RELA)
-    scanEhFrameSection(EH, EObj.relas(EH.RelocSection), Enqueue);
+  if (EH.AreRelocsRela)
+    scanEhFrameSection(EH, EH.relas(), Enqueue);
   else
-    scanEhFrameSection(EH, EObj.rels(EH.RelocSection), Enqueue);
+    scanEhFrameSection(EH, EH.rels(), Enqueue);
 }
 
 // We do not garbage-collect two types of sections:
@@ -238,18 +234,14 @@ template <class ELFT> void elf::markLive() {
 
   // Preserve special sections and those which are specified in linker
   // script KEEP command.
-  for (ObjectFile<ELFT> *F : Symtab<ELFT>::X->getObjectFiles()) {
-    for (InputSectionBase<ELFT> *Sec : F->getSections()) {
-      if (!Sec || Sec == &InputSection<ELFT>::Discarded)
-        continue;
-      // .eh_frame is always marked as live now, but also it can reference to
-      // sections that contain personality. We preserve all non-text sections
-      // referred by .eh_frame here.
-      if (auto *EH = dyn_cast_or_null<EhInputSection<ELFT>>(Sec))
-        scanEhFrameSection<ELFT>(*EH, Enqueue);
-      if (isReserved(Sec) || Script<ELFT>::X->shouldKeep(Sec))
-        Enqueue({Sec, 0});
-    }
+  for (InputSectionBase<ELFT> *Sec : Symtab<ELFT>::X->Sections) {
+    // .eh_frame is always marked as live now, but also it can reference to
+    // sections that contain personality. We preserve all non-text sections
+    // referred by .eh_frame here.
+    if (auto *EH = dyn_cast_or_null<EhInputSection<ELFT>>(Sec))
+      scanEhFrameSection<ELFT>(*EH, Enqueue);
+    if (isReserved(Sec) || Script<ELFT>::X->shouldKeep(Sec))
+      Enqueue({Sec, 0});
   }
 
   // Mark all reachable sections.

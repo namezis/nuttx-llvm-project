@@ -954,6 +954,9 @@ SANITIZER_INTERFACE_ATTRIBUTE void __sanitizer_cov_init() {
 }
 SANITIZER_INTERFACE_ATTRIBUTE void __sanitizer_cov_dump() {
   coverage_data.DumpAll();
+#if SANITIZER_LINUX
+  __sanitizer_dump_trace_pc_guard_coverage();
+#endif
 }
 SANITIZER_INTERFACE_ATTRIBUTE void
 __sanitizer_cov_module_init(s32 *guards, uptr npcs, u8 *counters,
@@ -1036,10 +1039,6 @@ void __sanitizer_cov_trace_div8() {}
 SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE
 void __sanitizer_cov_trace_gep() {}
 SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE
-void __sanitizer_cov_trace_pc_guard() {}
-SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE
 void __sanitizer_cov_trace_pc_indir() {}
-SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE
-void __sanitizer_cov_trace_pc_guard_init() {}
 #endif  // !SANITIZER_WINDOWS
 } // extern "C"

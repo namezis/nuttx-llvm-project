@@ -259,6 +259,13 @@ TEST_F(FormatTestJS, ContainerLiterals) {
                "  b: b,\n"
                "  'c': c,\n"
                "};");
+
+  // Dict literals can skip the label names.
+  verifyFormat("var x = {\n"
+               "  aaa,\n"
+               "  aaa,\n"
+               "  aaa,\n"
+               "};");
 }
 
 TEST_F(FormatTestJS, MethodsInObjectLiterals) {
@@ -347,6 +354,47 @@ TEST_F(FormatTestJS, FormatsNamespaces) {
   verifyFormat("declare namespace Foo {\n"
                "  export let x: number;\n"
                "}\n");
+}
+
+TEST_F(FormatTestJS, NamespacesMayNotWrap) {
+  verifyFormat("declare namespace foobarbaz {\n"
+               "}\n", getGoogleJSStyleWithColumns(18));
+  verifyFormat("declare module foobarbaz {\n"
+               "}\n", getGoogleJSStyleWithColumns(15));
+  verifyFormat("namespace foobarbaz {\n"
+               "}\n", getGoogleJSStyleWithColumns(10));
+  verifyFormat("module foobarbaz {\n"
+               "}\n", getGoogleJSStyleWithColumns(7));
+}
+
+TEST_F(FormatTestJS, AmbientDeclarations) {
+  FormatStyle NineCols = getGoogleJSStyleWithColumns(9);
+  verifyFormat(
+      "declare class\n"
+      "    X {}",
+      NineCols);
+  verifyFormat(
+      "declare function\n"
+      "x();",  // TODO(martinprobst): should ideally be indented.
+      NineCols);
+  verifyFormat("declare function foo();\n"
+               "let x = 1;\n");
+  verifyFormat("declare function foo(): string;\n"
+               "let x = 1;\n");
+  verifyFormat("declare function foo(): {x: number};\n"
+               "let x = 1;\n");
+  verifyFormat("declare class X {}\n"
+               "let x = 1;\n");
+  verifyFormat("declare interface Y {}\n"
+               "let x = 1;\n");
+  verifyFormat(
+      "declare enum X {\n"
+      "}",
+      NineCols);
+  verifyFormat(
+      "declare let\n"
+      "    x: number;",
+      NineCols);
 }
 
 TEST_F(FormatTestJS, FormatsFreestandingFunctions) {
@@ -493,8 +541,8 @@ TEST_F(FormatTestJS, FunctionLiterals) {
                "      foo();\n"
                "      bar();\n"
                "    },\n"
-               "    this, arg1IsReallyLongAndNeeedsLineBreaks,\n"
-               "    arg3IsReallyLongAndNeeedsLineBreaks);");
+               "    this, arg1IsReallyLongAndNeedsLineBreaks,\n"
+               "    arg3IsReallyLongAndNeedsLineBreaks);");
   verifyFormat("var closure = goog.bind(function() {  // comment\n"
                "  foo();\n"
                "  bar();\n"
@@ -810,6 +858,26 @@ TEST_F(FormatTestJS, AutomaticSemicolonInsertionHeuristic) {
                "return 1",
                "a = null\n"
                "  return   1");
+  verifyFormat(
+      "x = {\n"
+      "  a: 1\n"
+      "}\n"
+      "class Y {}",
+      "  x  =  {a  : 1}\n"
+      "   class  Y {  }");
+}
+
+TEST_F(FormatTestJS, ImportExportASI) {
+  verifyFormat(
+      "import {x} from 'y'\n"
+      "export function z() {}",
+      "import   {x} from 'y'\n"
+      "  export function z() {}");
+  verifyFormat(
+      "export {x}\n"
+      "class Y {}",
+      "  export {x}\n"
+      "  class  Y {\n}");
 }
 
 TEST_F(FormatTestJS, ClosureStyleCasts) {
@@ -1462,6 +1530,7 @@ TEST_F(FormatTestJS, NonNullAssertionOperator) {
   verifyFormat("let x = !foo;\n");
   verifyFormat("let x = foo[0]!;\n");
   verifyFormat("let x = (foo)!;\n");
+  verifyFormat("let x = foo! - 1;\n");
   verifyFormat("let x = {foo: 1}!;\n");
 }
 

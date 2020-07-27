@@ -144,7 +144,7 @@ static StringRef sanitizeFilenameAsIdentifier(StringRef Name,
 /// \brief Determine whether the given file name is the name of a builtin
 /// header, supplied by Clang to replace, override, or augment existing system
 /// headers.
-static bool isBuiltinHeader(StringRef FileName) {
+bool ModuleMap::isBuiltinHeader(StringRef FileName) {
   return llvm::StringSwitch<bool>(FileName)
            .Case("float.h", true)
            .Case("iso646.h", true)
@@ -165,7 +165,7 @@ ModuleMap::findKnownHeader(const FileEntry *File) {
   HeadersMap::iterator Known = Headers.find(File);
   if (HeaderInfo.getHeaderSearchOpts().ImplicitModuleMaps &&
       Known == Headers.end() && File->getDir() == BuiltinIncludeDir &&
-      isBuiltinHeader(llvm::sys::path::filename(File->getName()))) {
+      ModuleMap::isBuiltinHeader(llvm::sys::path::filename(File->getName()))) {
     HeaderInfo.loadTopLevelSystemModules();
     return Headers.find(File);
   }
@@ -446,9 +446,19 @@ ModuleMap::isHeaderUnavailableInModule(const FileEntry *Header,
              I = Known->second.begin(),
              E = Known->second.end();
          I != E; ++I) {
-      if (I->isAvailable() && (!RequestingModule ||
-                               I->getModule()->isSubModuleOf(RequestingModule)))
+
+      if (I->isAvailable() &&
+          (!RequestingModule ||
+           I->getModule()->isSubModuleOf(RequestingModule))) {
+        // When no requesting module is available, the caller is looking if a
+        // header is part a module by only looking into the module map. This is
+        // done by warn_uncovered_module_header checks; don't consider textual
+        // headers part of it in this mode, otherwise we get misleading warnings
+        // that a umbrella header is not including a textual header.
+        if (!RequestingModule && I->getRole() == ModuleMap::TextualHeader)
+          continue;
         return false;
+      }
     }
     return true;
   }
@@ -596,8 +606,7 @@ static void inferFrameworkLink(Module *Mod, const DirectoryEntry *FrameworkDir,
   // The library name of a framework has more than one possible extension since
   // the introduction of the text-based dynamic library format. We need to check
   // for both before we give up.
-  static const char *frameworkExtensions[] = {"", ".tbd"};
-  for (const auto *extension : frameworkExtensions) {
+  for (const char *extension : {"", ".tbd"}) {
     llvm::sys::path::replace_extension(LibName, extension);
     if (FileMgr.getFile(LibName)) {
       Mod->LinkLibraries.push_back(Module::LinkLibrary(Mod->Name,
@@ -828,7 +837,7 @@ void ModuleMap::addHeader(Module *Mod, Module::Header Header,
       return;
 
   HeaderList.push_back(KH);
-  Mod->Headers[headerRoleToKind(Role)].push_back(std::move(Header));
+  Mod->Headers[headerRoleToKind(Role)].push_back(Header);
 
   bool isCompilingModuleHeader =
       LangOpts.isCompilingModule() && Mod->getTopLevelModule() == SourceModule;
@@ -1491,6 +1500,42 @@ void ModuleMapParser::parseModuleDecl() {
     ActiveModule->NoUndeclaredIncludes = true;
   ActiveModule->Directory = Directory;
 
+  if (!ActiveModule->Parent) {
+    StringRef MapFileName(ModuleMapFile->getName());
+    if (MapFileName.endswith("module.private.modulemap") ||
+        MapFileName.endswith("module_private.map")) {
+      // Adding a top-level module from a private modulemap is likely a
+      // user error; we check to see if there's another top-level module
+      // defined in the non-private map in the same dir, and if so emit a
+      // warning.
+      for (auto E = Map.module_begin(); E != Map.module_end(); ++E) {
+        auto const *M = E->getValue();
+        if (!M->Parent &&
+            M->Directory == ActiveModule->Directory &&
+            M->Name != ActiveModule->Name) {
+          Diags.Report(ActiveModule->DefinitionLoc,
+                       diag::warn_mmap_mismatched_top_level_private)
+            << ActiveModule->Name << M->Name;
+          // The pattern we're defending against here is typically due to
+          // a module named FooPrivate which is supposed to be a submodule
+          // called Foo.Private. Emit a fixit in that case.
+          auto D =
+            Diags.Report(ActiveModule->DefinitionLoc,
+                         diag::note_mmap_rename_top_level_private_as_submodule);
+          D << ActiveModule->Name << M->Name;
+          StringRef Bad(ActiveModule->Name);
+          if (Bad.consume_back("Private")) {
+            SmallString<128> Fixed = Bad;
+            Fixed.append(".Private");
+            D << FixItHint::CreateReplacement(ActiveModule->DefinitionLoc,
+                                              Fixed);
+          }
+          break;
+        }
+      }
+    }
+  }
+
   bool Done = false;
   do {
     switch (Tok.Kind) {
@@ -1655,15 +1700,12 @@ void ModuleMapParser::parseExternModuleDecl() {
 ///    was never correct and causes issues now that we check it, so drop it.
 static bool shouldAddRequirement(Module *M, StringRef Feature,
                                  bool &IsRequiresExcludedHack) {
-  static const StringRef DarwinCExcluded[] = {"Darwin", "C", "excluded"};
-  static const StringRef TclPrivate[] = {"Tcl", "Private"};
-  static const StringRef IOKitAVC[] = {"IOKit", "avc"};
-
-  if (Feature == "excluded" && (M->fullModuleNameIs(DarwinCExcluded) ||
-                                M->fullModuleNameIs(TclPrivate))) {
+  if (Feature == "excluded" &&
+      (M->fullModuleNameIs({"Darwin", "C", "excluded"}) ||
+       M->fullModuleNameIs({"Tcl", "Private"}))) {
     IsRequiresExcludedHack = true;
     return false;
-  } else if (Feature == "cplusplus" && M->fullModuleNameIs(IOKitAVC)) {
+  } else if (Feature == "cplusplus" && M->fullModuleNameIs({"IOKit", "avc"})) {
     return false;
   }
 
@@ -1847,7 +1889,7 @@ void ModuleMapParser::parseHeaderDecl(MMToken::TokenKind LeadingToken,
       // supplied by Clang. Find that builtin header.
       if (ActiveModule->IsSystem && LeadingToken != MMToken::UmbrellaKeyword &&
           BuiltinIncludeDir && BuiltinIncludeDir != Directory &&
-          isBuiltinHeader(Header.FileName)) {
+          ModuleMap::isBuiltinHeader(Header.FileName)) {
         SmallString<128> BuiltinPathName(BuiltinIncludeDir->getName());
         llvm::sys::path::append(BuiltinPathName, Header.FileName);
         BuiltinFile = SourceMgr.getFileManager().getFile(BuiltinPathName);

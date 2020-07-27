@@ -165,7 +165,7 @@ bool ARMAsmPrinter::runOnMachineFunction(MachineFunction &MF) {
   EmitFunctionBody();
 
   // Emit the XRay table for this function.
-  EmitXRayTable();
+  emitXRayTable();
 
   // If we need V4T thumb mode Register Indirect Jump pads, emit them.
   // These are created per function, rather than per TU, since it's
@@ -232,6 +232,8 @@ void ARMAsmPrinter::printOperand(const MachineInstr *MI, int OpNum,
     break;
   }
   case MachineOperand::MO_ConstantPoolIndex:
+    if (Subtarget->genExecuteOnly())
+      llvm_unreachable("execute-only should not generate constant pools");
     GetCPISymbol(MO.getIndex())->print(O, MAI);
     break;
   }
@@ -1741,6 +1743,14 @@ void ARMAsmPrinter::EmitInstruction(const MachineInstr *MI) {
       //    LSLS idx, #1
       //    ADDS pc, pc, idx
 
+      // When using PC as the base, it's important that there is no padding
+      // between the last ADDS and the start of the jump table. The jump table
+      // is 4-byte aligned, so we ensure we're 4 byte aligned here too.
+      //
+      // FIXME: Ideally we could vary the LDRB index based on the padding
+      // between the sequence and jump table, however that relies on MCExprs
+      // for load indexes which are currently not supported.
+      OutStreamer->EmitCodeAlignment(4);
       EmitToStreamer(*OutStreamer, MCInstBuilder(ARM::tADDhirr)
                                        .addReg(Idx)
                                        .addReg(Idx)

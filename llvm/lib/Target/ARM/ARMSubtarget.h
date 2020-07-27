@@ -25,6 +25,7 @@
 #include "Thumb1InstrInfo.h"
 #include "Thumb2InstrInfo.h"
 #include "llvm/ADT/Triple.h"
+#include "llvm/CodeGen/GlobalISel/GISelAccessor.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/MC/MCInstrItineraries.h"
 #include "llvm/Target/TargetSubtargetInfo.h"
@@ -300,6 +301,9 @@ protected:
   /// Generate calls via indirect call instructions.
   bool GenLongCalls = false;
 
+  /// Generate code that does not contain data access to code sections.
+  bool GenExecuteOnly = false;
+
   /// Target machine allowed unsafe FP math (such as use of NEON fp)
   bool UnsafeFPMath = false;
 
@@ -350,6 +354,9 @@ public:
   ARMSubtarget(const Triple &TT, const std::string &CPU, const std::string &FS,
                const ARMBaseTargetMachine &TM, bool IsLittle);
 
+  /// This object will take onwership of \p GISelAccessor.
+  void setGISelAccessor(GISelAccessor &GISel) { this->GISel.reset(&GISel); }
+
   /// getMaxInlineSizeThreshold - Returns the maximum memset / memcpy size
   /// that still makes it profitable to inline the call.
   unsigned getMaxInlineSizeThreshold() const {
@@ -379,6 +386,11 @@ public:
     return &InstrInfo->getRegisterInfo();
   }
 
+  const CallLowering *getCallLowering() const override;
+  const InstructionSelector *getInstructionSelector() const override;
+  const LegalizerInfo *getLegalizerInfo() const override;
+  const RegisterBankInfo *getRegBankInfo() const override;
+
 private:
   ARMSelectionDAGInfo TSInfo;
   // Either Thumb1FrameLowering or ARMFrameLowering.
@@ -386,6 +398,11 @@ private:
   // Either Thumb1InstrInfo or Thumb2InstrInfo.
   std::unique_ptr<ARMBaseInstrInfo> InstrInfo;
   ARMTargetLowering   TLInfo;
+
+  /// Gather the accessor points to GlobalISel-related APIs.
+  /// This is used to avoid ifndefs spreading around while GISel is
+  /// an optional library.
+  std::unique_ptr<GISelAccessor> GISel;
 
   void initializeEnvironment();
   void initSubtargetFeatures(StringRef CPU, StringRef FS);
@@ -480,6 +497,7 @@ public:
   bool useNaClTrap() const { return UseNaClTrap; }
   bool useSjLjEH() const { return UseSjLjEH; }
   bool genLongCalls() const { return GenLongCalls; }
+  bool genExecuteOnly() const { return GenExecuteOnly; }
 
   bool hasFP16() const { return HasFP16; }
   bool hasD16() const { return HasD16; }

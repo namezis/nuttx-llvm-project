@@ -320,6 +320,9 @@ public:
   /// ignored.
   void setLocation(SourceLocation Loc);
 
+  // Converts a SourceLocation to a DebugLoc
+  llvm::DebugLoc SourceLocToDebugLoc(SourceLocation Loc);
+
   /// Emit metadata to indicate a change in line/column information in
   /// the source file. If the location is invalid, the previous
   /// location will be reused.
@@ -439,6 +442,10 @@ private:
   /// Remap a given path with the current debug prefix map
   std::string remapDIPath(StringRef) const;
 
+  /// Compute the file checksum debug info for input file ID.
+  llvm::DIFile::ChecksumKind computeChecksum(FileID FID,
+                                             SmallString<32> &Checksum) const;
+
   /// Get the file debug info descriptor for the input location.
   llvm::DIFile *getOrCreateFile(SourceLocation Loc);
 
@@ -493,14 +500,14 @@ private:
   llvm::DIGlobalVariable *
   getGlobalVariableForwardDeclaration(const VarDecl *VD);
 
-  /// \brief Return a global variable that represents one of the
-  /// collection of global variables created for an anonmyous union.
+  /// Return a global variable that represents one of the collection of global
+  /// variables created for an anonmyous union.
   ///
   /// Recursively collect all of the member fields of a global
   /// anonymous decl and create static variables for them. The first
   /// time this is called it needs to be on a union and then from
   /// there we can have additional unnamed fields.
-  llvm::DIGlobalVariable *
+  llvm::DIGlobalVariableExpression *
   CollectAnonRecordDecls(const RecordDecl *RD, llvm::DIFile *Unit,
                          unsigned LineNo, StringRef LinkageName,
                          llvm::GlobalVariable *Var, llvm::DIScope *DContext);

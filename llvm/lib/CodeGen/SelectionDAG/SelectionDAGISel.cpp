@@ -725,9 +725,8 @@ void SelectionDAGISel::ComputeLiveOutVRegInfo() {
 }
 
 void SelectionDAGISel::CodeGenAndEmitDAG() {
-  std::string GroupName;
-  if (TimePassesIsEnabled)
-    GroupName = "Instruction Selection and Scheduling";
+  StringRef GroupName = "sdag";
+  StringRef GroupDescription = "Instruction Selection and Scheduling";
   std::string BlockName;
   int BlockNumber = -1;
   (void)BlockNumber;
@@ -755,7 +754,8 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
 
   // Run the DAG combiner in pre-legalize mode.
   {
-    NamedRegionTimer T("DAG Combining 1", GroupName, TimePassesIsEnabled);
+    NamedRegionTimer T("combine1", "DAG Combining 1", GroupName,
+                       GroupDescription, TimePassesIsEnabled);
     CurDAG->Combine(BeforeLegalizeTypes, *AA, OptLevel);
   }
 
@@ -769,7 +769,8 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
 
   bool Changed;
   {
-    NamedRegionTimer T("Type Legalization", GroupName, TimePassesIsEnabled);
+    NamedRegionTimer T("legalize_types", "Type Legalization", GroupName,
+                       GroupDescription, TimePassesIsEnabled);
     Changed = CurDAG->LegalizeTypes();
   }
 
@@ -784,8 +785,8 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
 
     // Run the DAG combiner in post-type-legalize mode.
     {
-      NamedRegionTimer T("DAG Combining after legalize types", GroupName,
-                         TimePassesIsEnabled);
+      NamedRegionTimer T("combine_lt", "DAG Combining after legalize types",
+                         GroupName, GroupDescription, TimePassesIsEnabled);
       CurDAG->Combine(AfterLegalizeTypes, *AA, OptLevel);
     }
 
@@ -795,13 +796,15 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
   }
 
   {
-    NamedRegionTimer T("Vector Legalization", GroupName, TimePassesIsEnabled);
+    NamedRegionTimer T("legalize_vec", "Vector Legalization", GroupName,
+                       GroupDescription, TimePassesIsEnabled);
     Changed = CurDAG->LegalizeVectors();
   }
 
   if (Changed) {
     {
-      NamedRegionTimer T("Type Legalization 2", GroupName, TimePassesIsEnabled);
+      NamedRegionTimer T("legalize_types2", "Type Legalization 2", GroupName,
+                         GroupDescription, TimePassesIsEnabled);
       CurDAG->LegalizeTypes();
     }
 
@@ -810,8 +813,8 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
 
     // Run the DAG combiner in post-type-legalize mode.
     {
-      NamedRegionTimer T("DAG Combining after legalize vectors", GroupName,
-                         TimePassesIsEnabled);
+      NamedRegionTimer T("combine_lv", "DAG Combining after legalize vectors",
+                         GroupName, GroupDescription, TimePassesIsEnabled);
       CurDAG->Combine(AfterLegalizeVectorOps, *AA, OptLevel);
     }
 
@@ -823,7 +826,8 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
     CurDAG->viewGraph("legalize input for " + BlockName);
 
   {
-    NamedRegionTimer T("DAG Legalization", GroupName, TimePassesIsEnabled);
+    NamedRegionTimer T("legalize", "DAG Legalization", GroupName,
+                       GroupDescription, TimePassesIsEnabled);
     CurDAG->Legalize();
   }
 
@@ -835,7 +839,8 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
 
   // Run the DAG combiner in post-legalize mode.
   {
-    NamedRegionTimer T("DAG Combining 2", GroupName, TimePassesIsEnabled);
+    NamedRegionTimer T("combine2", "DAG Combining 2", GroupName,
+                       GroupDescription, TimePassesIsEnabled);
     CurDAG->Combine(AfterLegalizeDAG, *AA, OptLevel);
   }
 
@@ -851,7 +856,8 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
   // Third, instruction select all of the operations to machine code, adding the
   // code to the MachineBasicBlock.
   {
-    NamedRegionTimer T("Instruction Selection", GroupName, TimePassesIsEnabled);
+    NamedRegionTimer T("isel", "Instruction Selection", GroupName,
+                       GroupDescription, TimePassesIsEnabled);
     DoInstructionSelection();
   }
 
@@ -864,8 +870,8 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
   // Schedule machine code.
   ScheduleDAGSDNodes *Scheduler = CreateScheduler();
   {
-    NamedRegionTimer T("Instruction Scheduling", GroupName,
-                       TimePassesIsEnabled);
+    NamedRegionTimer T("sched", "Instruction Scheduling", GroupName,
+                       GroupDescription, TimePassesIsEnabled);
     Scheduler->Run(CurDAG, FuncInfo->MBB);
   }
 
@@ -876,7 +882,8 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
   // inserted into.
   MachineBasicBlock *FirstMBB = FuncInfo->MBB, *LastMBB;
   {
-    NamedRegionTimer T("Instruction Creation", GroupName, TimePassesIsEnabled);
+    NamedRegionTimer T("emit", "Instruction Creation", GroupName,
+                       GroupDescription, TimePassesIsEnabled);
 
     // FuncInfo->InsertPt is passed by reference and set to the end of the
     // scheduled instructions.
@@ -890,8 +897,8 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
 
   // Free the scheduler state.
   {
-    NamedRegionTimer T("Instruction Scheduling Cleanup", GroupName,
-                       TimePassesIsEnabled);
+    NamedRegionTimer T("cleanup", "Instruction Scheduling Cleanup", GroupName,
+                       GroupDescription, TimePassesIsEnabled);
     delete Scheduler;
   }
 
@@ -1007,10 +1014,10 @@ bool SelectionDAGISel::PrepareEHLandingPad() {
 
   // Add a label to mark the beginning of the landing pad.  Deletion of the
   // landing pad can thus be detected via the MachineModuleInfo.
-  MCSymbol *Label = MF->getMMI().addLandingPad(MBB);
+  MCSymbol *Label = MF->addLandingPad(MBB);
 
   // Assign the call site to the landing pad's begin label.
-  MF->getMMI().setCallSiteLandingPad(Label, SDB->LPadToCallSiteMap[MBB]);
+  MF->setCallSiteLandingPad(Label, SDB->LPadToCallSiteMap[MBB]);
 
   const MCInstrDesc &II = TII->get(TargetOpcode::EH_LABEL);
   BuildMI(*MBB, FuncInfo->InsertPt, SDB->getCurDebugLoc(), II)
@@ -2241,7 +2248,7 @@ GetVBR(uint64_t Val, const unsigned char *MatcherTable, unsigned &Idx) {
 /// to use the new results.
 void SelectionDAGISel::UpdateChains(
     SDNode *NodeToMatch, SDValue InputChain,
-    const SmallVectorImpl<SDNode *> &ChainNodesMatched, bool isMorphNodeTo) {
+    SmallVectorImpl<SDNode *> &ChainNodesMatched, bool isMorphNodeTo) {
   SmallVector<SDNode*, 4> NowDeadNodes;
 
   // Now that all the normal results are replaced, we replace the chain and
@@ -2253,6 +2260,11 @@ void SelectionDAGISel::UpdateChains(
     // Replace all the chain results with the final chain we ended up with.
     for (unsigned i = 0, e = ChainNodesMatched.size(); i != e; ++i) {
       SDNode *ChainNode = ChainNodesMatched[i];
+      // If ChainNode is null, it's because we replaced it on a previous
+      // iteration and we cleared it out of the map. Just skip it.
+      if (!ChainNode)
+        continue;
+
       assert(ChainNode->getOpcode() != ISD::DELETED_NODE &&
              "Deleted node left in chain");
 
@@ -2265,6 +2277,11 @@ void SelectionDAGISel::UpdateChains(
       if (ChainVal.getValueType() == MVT::Glue)
         ChainVal = ChainVal.getValue(ChainVal->getNumValues()-2);
       assert(ChainVal.getValueType() == MVT::Other && "Not a chain?");
+      SelectionDAG::DAGNodeDeletedListener NDL(
+          *CurDAG, [&](SDNode *N, SDNode *E) {
+            std::replace(ChainNodesMatched.begin(), ChainNodesMatched.end(), N,
+                         static_cast<SDNode *>(nullptr));
+          });
       CurDAG->ReplaceAllUsesOfValueWith(ChainVal, InputChain);
 
       // If the node became dead and we haven't already seen it, delete it.
@@ -2765,14 +2782,15 @@ struct MatchScope {
 /// for this.
 class MatchStateUpdater : public SelectionDAG::DAGUpdateListener
 {
-      SmallVectorImpl<std::pair<SDValue, SDNode*> > &RecordedNodes;
-      SmallVectorImpl<MatchScope> &MatchScopes;
+  SDNode **NodeToMatch;
+  SmallVectorImpl<std::pair<SDValue, SDNode *>> &RecordedNodes;
+  SmallVectorImpl<MatchScope> &MatchScopes;
 public:
-  MatchStateUpdater(SelectionDAG &DAG,
-                    SmallVectorImpl<std::pair<SDValue, SDNode*> > &RN,
-                    SmallVectorImpl<MatchScope> &MS) :
-    SelectionDAG::DAGUpdateListener(DAG),
-    RecordedNodes(RN), MatchScopes(MS) { }
+  MatchStateUpdater(SelectionDAG &DAG, SDNode **NodeToMatch,
+                    SmallVectorImpl<std::pair<SDValue, SDNode *>> &RN,
+                    SmallVectorImpl<MatchScope> &MS)
+      : SelectionDAG::DAGUpdateListener(DAG), NodeToMatch(NodeToMatch),
+        RecordedNodes(RN), MatchScopes(MS) {}
 
   void NodeDeleted(SDNode *N, SDNode *E) override {
     // Some early-returns here to avoid the search if we deleted the node or
@@ -2782,6 +2800,9 @@ public:
     // update listener during matching a complex patterns.
     if (!E || E->isMachineOpcode())
       return;
+    // Check if NodeToMatch was updated.
+    if (N == *NodeToMatch)
+      *NodeToMatch = E;
     // Performing linear search here does not matter because we almost never
     // run this code.  You'd have to have a CSE during complex pattern
     // matching.
@@ -3074,7 +3095,7 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
       // consistent.
       std::unique_ptr<MatchStateUpdater> MSU;
       if (ComplexPatternFuncMutatesDAG())
-        MSU.reset(new MatchStateUpdater(*CurDAG, RecordedNodes,
+        MSU.reset(new MatchStateUpdater(*CurDAG, &NodeToMatch, RecordedNodes,
                                         MatchScopes));
 
       if (!CheckComplexPattern(NodeToMatch, RecordedNodes[RecNo].second,

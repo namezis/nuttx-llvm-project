@@ -39,10 +39,14 @@ public:
       return "Remote indirect stubs owner does not exist";
     case OrcErrorCode::RemoteIndirectStubsOwnerIdAlreadyInUse:
       return "Remote indirect stubs owner Id already in use";
+    case OrcErrorCode::RPCResponseAbandoned:
+      return "RPC response abandoned";
     case OrcErrorCode::UnexpectedRPCCall:
       return "Unexpected RPC call";
     case OrcErrorCode::UnexpectedRPCResponse:
       return "Unexpected RPC response";
+    case OrcErrorCode::UnknownRPCFunction:
+      return "Unknown RPC function";
     }
     llvm_unreachable("Unhandled error code");
   }

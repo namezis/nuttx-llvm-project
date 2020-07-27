@@ -73,6 +73,13 @@ def FeatureUnalignedScratchAccess : SubtargetFeature<"unaligned-scratch-access",
   "Support unaligned scratch loads and stores"
 >;
 
+// XNACK is disabled if SH_MEM_CONFIG.ADDRESS_MODE = GPUVM on chips that support
+// XNACK. The current default kernel driver setting is:
+// - graphics ring: XNACK disabled
+// - compute ring: XNACK enabled
+//
+// If XNACK is enabled, the VMEM latency can be worse.
+// If XNACK is disabled, the 2 SGPRs can be used for general purposes.
 def FeatureXNACK : SubtargetFeature<"xnack",
   "EnableXNACK",
   "true",
@@ -187,6 +194,12 @@ def FeatureScalarStores : SubtargetFeature<"scalar-stores",
 // Subtarget Features (options and debugging)
 //===------------------------------------------------------------===//
 
+def FeatureFP16Denormals : SubtargetFeature<"fp16-denormals",
+  "FP16Denormals",
+  "true",
+  "Enable half precision denormal handling"
+>;
+
 // Some instructions do not support denormals despite this flag. Using
 // fp32 denormals also causes instructions to run at the double
 // precision rate for the device.
@@ -269,6 +282,12 @@ def FeatureEnableSIScheduler : SubtargetFeature<"si-scheduler",
   "Enable SI Machine Scheduler"
 >;
 
+// Unless +-flat-for-global is specified, turn on FlatForGlobal for
+// all OS-es on VI and newer hardware to avoid assertion failures due
+// to missing ADDR64 variants of MUBUF instructions.
+// FIXME: moveToVALU should be able to handle converting addr64 MUBUF
+// instructions.
+
 def FeatureFlatForGlobal : SubtargetFeature<"flat-for-global",
   "FlatForGlobal",
   "true",
@@ -350,8 +369,7 @@ def FeatureISAVersion7_0_1 : SubtargetFeatureISAVersion <7,0,1,
 
 def FeatureISAVersion7_0_2 : SubtargetFeatureISAVersion <7,0,2,
   [FeatureSeaIslands,
-   FeatureLDSBankCount16,
-   FeatureXNACK]>;
+   FeatureLDSBankCount16]>;
 
 def FeatureISAVersion8_0_0 : SubtargetFeatureISAVersion <8,0,0,
   [FeatureVolcanicIslands,
@@ -492,6 +510,8 @@ def isCIVI : Predicate <
 >, AssemblerPredicate<"FeatureCIInsts">;
 
 def HasFlatAddressSpace : Predicate<"Subtarget->hasFlatAddressSpace()">;
+
+def Has16BitInsts : Predicate<"Subtarget->has16BitInsts()">;
 
 class PredicateControl {
   Predicate SubtargetPredicate;

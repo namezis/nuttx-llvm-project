@@ -13,14 +13,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "AMDGPUSubtarget.h"
-#include "R600ISelLowering.h"
-#include "R600InstrInfo.h"
-#include "SIFrameLowering.h"
-#include "SIISelLowering.h"
-#include "SIInstrInfo.h"
-#include "SIMachineFunctionInfo.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/CodeGen/MachineScheduler.h"
+#include "llvm/Target/TargetFrameLowering.h"
+#include <algorithm>
 
 using namespace llvm;
 
@@ -31,7 +27,7 @@ using namespace llvm;
 #define GET_SUBTARGETINFO_CTOR
 #include "AMDGPUGenSubtargetInfo.inc"
 
-AMDGPUSubtarget::~AMDGPUSubtarget() {}
+AMDGPUSubtarget::~AMDGPUSubtarget() = default;
 
 AMDGPUSubtarget &
 AMDGPUSubtarget::initializeSubtargetDependencies(const Triple &TT,
@@ -52,10 +48,18 @@ AMDGPUSubtarget::initializeSubtargetDependencies(const Triple &TT,
 
   ParseSubtargetFeatures(GPU, FullFS);
 
+  // Unless +-flat-for-global is specified, turn on FlatForGlobal for all OS-es
+  // on VI and newer hardware to avoid assertion failures due to missing ADDR64
+  // variants of MUBUF instructions.
+  if (!hasAddr64() && !FS.contains("flat-for-global")) {
+    FlatForGlobal = true;
+  }
+
   // FIXME: I don't think think Evergreen has any useful support for
   // denormals, but should be checked. Should we issue a warning somewhere
   // if someone tries to enable these?
   if (getGeneration() <= AMDGPUSubtarget::NORTHERN_ISLANDS) {
+    FP16Denormals = false;
     FP32Denormals = false;
     FP64Denormals = false;
   }
@@ -81,6 +85,7 @@ AMDGPUSubtarget::AMDGPUSubtarget(const Triple &TT, StringRef GPU, StringRef FS,
     FastFMAF32(false),
     HalfRate64Ops(false),
 
+    FP16Denormals(false),
     FP32Denormals(false),
     FP64Denormals(false),
     FPExceptions(false),
@@ -119,10 +124,10 @@ AMDGPUSubtarget::AMDGPUSubtarget(const Triple &TT, StringRef GPU, StringRef FS,
     CFALUBug(false),
     HasVertexCache(false),
     TexVTXClauseSize(0),
+    ScalarizeGlobal(false),
 
     FeatureDisable(false),
-    InstrItins(getInstrItineraryForCPU(GPU)),
-    TSInfo() {
+    InstrItins(getInstrItineraryForCPU(GPU)) {
   initializeSubtargetDependencies(TT, GPU, FS);
 }
 
@@ -186,7 +191,6 @@ unsigned AMDGPUSubtarget::getOccupancyWithLocalMemSize(uint32_t Bytes) const {
 
 std::pair<unsigned, unsigned> AMDGPUSubtarget::getFlatWorkGroupSizes(
   const Function &F) const {
-
   // Default minimum/maximum flat work group sizes.
   std::pair<unsigned, unsigned> Default =
     AMDGPU::isCompute(F.getCallingConv()) ?
@@ -219,7 +223,6 @@ std::pair<unsigned, unsigned> AMDGPUSubtarget::getFlatWorkGroupSizes(
 
 std::pair<unsigned, unsigned> AMDGPUSubtarget::getWavesPerEU(
   const Function &F) const {
-
   // Default minimum/maximum number of waves per execution unit.
   std::pair<unsigned, unsigned> Default(1, 0);
 
@@ -278,8 +281,7 @@ SISubtarget::SISubtarget(const Triple &TT, StringRef GPU, StringRef FS,
   AMDGPUSubtarget(TT, GPU, FS, TM),
   InstrInfo(*this),
   FrameLowering(TargetFrameLowering::StackGrowsUp, getStackAlignment(), 0),
-  TLInfo(TM, *this),
-  GISel() {}
+  TLInfo(TM, *this) {}
 
 void SISubtarget::overrideSchedPolicy(MachineSchedPolicy &Policy,
                                       unsigned NumRegionInstrs) const {
@@ -302,8 +304,9 @@ bool SISubtarget::isVGPRSpillingEnabled(const Function& F) const {
   return EnableVGPRSpilling || !AMDGPU::isShader(F.getCallingConv());
 }
 
-unsigned SISubtarget::getKernArgSegmentSize(unsigned ExplicitArgBytes) const {
-  unsigned ImplicitBytes = getImplicitArgNumBytes();
+unsigned SISubtarget::getKernArgSegmentSize(const MachineFunction &MF,
+					    unsigned ExplicitArgBytes) const {
+  unsigned ImplicitBytes = getImplicitArgNumBytes(MF);
   if (ImplicitBytes == 0)
     return ExplicitArgBytes;
 

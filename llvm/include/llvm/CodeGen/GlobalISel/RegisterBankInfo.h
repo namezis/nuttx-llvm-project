@@ -161,11 +161,11 @@ public:
     bool isValid() const { return BreakDown && NumBreakDowns; }
 
     /// Verify that this mapping makes sense for a value of
-    /// \p MeaningFulBitWidth.
+    /// \p MeaningfulBitWidth.
     /// \note This method does not check anything when assertions are disabled.
     ///
     /// \return True is the check was successful.
-    bool verify(unsigned MeaningFulBitWidth) const;
+    bool verify(unsigned MeaningfulBitWidth) const;
 
     /// Print this on dbgs() stream.
     void dump() const;
@@ -266,7 +266,7 @@ public:
   /// \todo When we move to TableGen this should be an array ref.
   typedef SmallVector<InstructionMapping, 4> InstructionMappings;
 
-  /// Helper class use to get/create the virtual registers that will be used
+  /// Helper class used to get/create the virtual registers that will be used
   /// to replace the MachineOperand when applying a mapping.
   class OperandsMapper {
     /// The OpIdx-th cell contains the index in NewVRegs where the VRegs of the
@@ -384,10 +384,6 @@ protected:
 
   /// Create a RegisterBankInfo that can accomodate up to \p NumRegBanks
   /// RegisterBank instances.
-  ///
-  /// \note For the verify method to succeed all the \p NumRegBanks
-  /// must be initialized by createRegisterBank and updated with
-  /// addRegBankCoverage RegisterBank.
   RegisterBankInfo(RegisterBank **RegBanks, unsigned NumRegBanks);
 
   /// This constructor is meaningless.
@@ -399,31 +395,6 @@ protected:
   RegisterBankInfo() {
     llvm_unreachable("This constructor should not be executed");
   }
-
-  /// Create a new register bank with the given parameter and add it
-  /// to RegBanks.
-  /// \pre \p ID must not already be used.
-  /// \pre \p ID < NumRegBanks.
-  void createRegisterBank(unsigned ID, const char *Name);
-
-  /// Add \p RCId to the set of register class that the register bank,
-  /// identified \p ID, covers.
-  /// This method transitively adds all the sub classes and the subreg-classes
-  /// of \p RCId to the set of covered register classes.
-  /// It also adjusts the size of the register bank to reflect the maximal
-  /// size of a value that can be hold into that register bank.
-  ///
-  /// \note This method does *not* add the super classes of \p RCId.
-  /// The rationale is if \p ID covers the registers of \p RCId, that
-  /// does not necessarily mean that \p ID covers the set of registers
-  /// of RCId's superclasses.
-  /// This method does *not* add the superreg classes as well for consistents.
-  /// The expected use is to add the coverage top-down with respect to the
-  /// register hierarchy.
-  ///
-  /// \todo TableGen should just generate the BitSet vector for us.
-  void addRegBankCoverage(unsigned ID, unsigned RCId,
-                          const TargetRegisterInfo &TRI);
 
   /// Get the register bank identified by \p ID.
   RegisterBank &getRegBank(unsigned ID) {
@@ -442,9 +413,9 @@ protected:
   ///
   /// This implementation is able to get the mapping of:
   /// - Target specific instructions by looking at the encoding constraints.
-  /// - Any instruction if all the register operands are already been assigned
+  /// - Any instruction if all the register operands have already been assigned
   ///   a register, a register class, or a register bank.
-  /// - Copies and phis if at least one of the operand has been assigned a
+  /// - Copies and phis if at least one of the operands has been assigned a
   ///   register, a register class, or a register bank.
   /// In other words, this method will likely fail to find a mapping for
   /// any generic opcode that has not been lowered by target specific code.
@@ -603,7 +574,7 @@ public:
   /// This mapping should be the direct translation of \p MI.
   /// In other words, when \p MI is mapped with the returned mapping,
   /// only the register banks of the operands of \p MI need to be updated.
-  /// In particular, neither the opcode or the type of \p MI needs to be
+  /// In particular, neither the opcode nor the type of \p MI needs to be
   /// updated for this direct mapping.
   ///
   /// The target independent implementation gives a mapping based on

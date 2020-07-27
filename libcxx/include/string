@@ -102,6 +102,8 @@ public:
                  const allocator_type& a = allocator_type());
     basic_string(const basic_string& str, size_type pos, size_type n,
                  const Allocator& a = Allocator());
+    template<class T>
+        basic_string(const T& t, size_type pos, size_type n, const Allocator& a = Allocator()); // C++17
     explicit basic_string(const basic_string_view<charT, traits> sv, const Allocator& a = Allocator());
     basic_string(const value_type* s, const allocator_type& a = allocator_type());
     basic_string(const value_type* s, size_type n, const allocator_type& a = allocator_type());
@@ -495,7 +497,7 @@ _LIBCPP_BEGIN_NAMESPACE_STD
 // fpos
 
 template <class _StateT>
-class _LIBCPP_TYPE_VIS_ONLY fpos
+class _LIBCPP_TEMPLATE_VIS fpos
 {
 private:
     _StateT __st_;
@@ -553,7 +555,7 @@ basic_string<_CharT, _Traits, _Allocator>
 operator+(const basic_string<_CharT, _Traits, _Allocator>& __x, _CharT __y);
 
 template <bool>
-class _LIBCPP_TYPE_VIS_ONLY __basic_string_common
+class _LIBCPP_TEMPLATE_VIS __basic_string_common
 {
 protected:
     _LIBCPP_NORETURN void __throw_length_error() const;
@@ -628,7 +630,7 @@ struct __padding<_CharT, 1>
 #endif  // _LIBCPP_ABI_ALTERNATE_STRING_LAYOUT
 
 template<class _CharT, class _Traits, class _Allocator>
-class _LIBCPP_TYPE_VIS_ONLY basic_string
+class _LIBCPP_TEMPLATE_VIS basic_string
     : private __basic_string_common<true>
 {
 public:
@@ -789,6 +791,10 @@ public:
     _LIBCPP_INLINE_VISIBILITY
     basic_string(const basic_string& __str, size_type __pos,
                  const allocator_type& __a = allocator_type());
+    template<class _Tp>
+        basic_string(const _Tp& __t, size_type __pos, size_type __n, 
+                     const allocator_type& __a = allocator_type(),
+                     typename enable_if<__can_be_converted_to_string_view<_CharT, _Traits, _Tp>::value, void>::type* = 0);
     _LIBCPP_INLINE_VISIBILITY explicit
     basic_string(__self_view __sv);
     _LIBCPP_INLINE_VISIBILITY
@@ -812,6 +818,10 @@ public:
     operator __self_view() const _NOEXCEPT { return __self_view(data(), size()); }
 
     basic_string& operator=(const basic_string& __str);
+
+#ifndef _LIBCPP_CXX03_LANG
+    template <class = void>
+#endif
     _LIBCPP_INLINE_VISIBILITY
     basic_string& operator=(__self_view __sv)  {return assign(__sv);}
 #ifndef _LIBCPP_HAS_NO_RVALUE_REFERENCES
@@ -1099,9 +1109,9 @@ public:
     _LIBCPP_INLINE_VISIBILITY
     void swap(basic_string& __str)
 #if _LIBCPP_STD_VER >= 14
-        _NOEXCEPT;
+        _NOEXCEPT_DEBUG;
 #else
-        _NOEXCEPT_(!__alloc_traits::propagate_on_container_swap::value || 
+        _NOEXCEPT_DEBUG_(!__alloc_traits::propagate_on_container_swap::value ||
                     __is_nothrow_swappable<allocator_type>::value);
 #endif
 
@@ -1717,6 +1727,20 @@ basic_string<_CharT, _Traits, _Allocator>::basic_string(const basic_string& __st
 }
 
 template <class _CharT, class _Traits, class _Allocator>
+template <class _Tp>
+basic_string<_CharT, _Traits, _Allocator>::basic_string(
+             const _Tp& __t, size_type __pos, size_type __n, const allocator_type& __a,
+			 typename enable_if<__can_be_converted_to_string_view<_CharT, _Traits, _Tp>::value, void>::type *)
+    : __r_(__a)
+{
+	__self_view __sv = __self_view(__t).substr(__pos, __n);
+    __init(__sv.data(), __sv.size());
+#if _LIBCPP_DEBUG_LEVEL >= 2
+    __get_db()->__insert_c(this);
+#endif	
+}
+
+template <class _CharT, class _Traits, class _Allocator>
 inline _LIBCPP_INLINE_VISIBILITY
 basic_string<_CharT, _Traits, _Allocator>::basic_string(__self_view __sv)
 {
@@ -2200,7 +2224,7 @@ bool __ptr_in_range (const _Tp* __p, const _Tp* __first, const _Tp* __last)
 }
 
 template <class _Tp1, class _Tp2>
-bool __ptr_in_range (const _Tp1* __p, const _Tp2* __first, const _Tp2* __last)
+bool __ptr_in_range (const _Tp1*, const _Tp2*, const _Tp2*)
 {
     return false;
 }
@@ -2976,9 +3000,9 @@ inline _LIBCPP_INLINE_VISIBILITY
 void
 basic_string<_CharT, _Traits, _Allocator>::swap(basic_string& __str)
 #if _LIBCPP_STD_VER >= 14
-        _NOEXCEPT
+        _NOEXCEPT_DEBUG
 #else
-        _NOEXCEPT_(!__alloc_traits::propagate_on_container_swap::value || 
+        _NOEXCEPT_DEBUG_(!__alloc_traits::propagate_on_container_swap::value ||
                     __is_nothrow_swappable<allocator_type>::value)
 #endif
 {
@@ -2989,6 +3013,10 @@ basic_string<_CharT, _Traits, _Allocator>::swap(basic_string& __str)
         __get_db()->__invalidate_all(&__str);
     __get_db()->swap(this, &__str);
 #endif
+    _LIBCPP_ASSERT(
+        __alloc_traits::propagate_on_container_swap::value ||
+        __alloc_traits::is_always_equal::value ||
+        __alloc() == __str.__alloc(), "swapping non-equal allocators");
     _VSTD::swap(__r_.first(), __str.__r_.first());
     __swap_allocator(__alloc(), __str.__alloc());
 }
@@ -3846,7 +3874,7 @@ template<class _CharT, class _Traits, class _Allocator>
                    basic_string<_CharT, _Traits, _Allocator>::npos;
 
 template<class _CharT, class _Traits, class _Allocator>
-struct _LIBCPP_TYPE_VIS_ONLY hash<basic_string<_CharT, _Traits, _Allocator> >
+struct _LIBCPP_TEMPLATE_VIS hash<basic_string<_CharT, _Traits, _Allocator> >
     : public unary_function<basic_string<_CharT, _Traits, _Allocator>, size_t>
 {
     size_t

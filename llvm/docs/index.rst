@@ -1,11 +1,6 @@
 Overview
 ========
 
-.. warning::
-
-   If you are using a released version of LLVM, see `the download page
-   <http://llvm.org/releases/>`_ to find your documentation.
-
 The LLVM compiler infrastructure supports a wide range of projects, from
 industrial strength compilers to specialized JIT applications to small
 research projects.
@@ -272,6 +267,9 @@ For API clients and LLVM developers.
    FaultMaps
    MIRLangRef
    Coroutines
+   GlobalISel
+   XRay
+   PDB/index
 
 :doc:`WritingAnLLVMPass`
    Information on how to write LLVM transformations and analyses.
@@ -389,6 +387,15 @@ For API clients and LLVM developers.
 
 :doc:`Coroutines`
   LLVM support for coroutines.
+
+:doc:`GlobalISel`
+  This describes the prototype instruction selection replacement, GlobalISel.
+
+:doc:`XRay`
+  High-level documentation of how to use XRay in LLVM.
+
+:doc:`The Microsoft PDB File Format <PDB/index>`
+  A detailed description of the Microsoft PDB (Program Database) file format.
 
 Development Process Documentation
 =================================

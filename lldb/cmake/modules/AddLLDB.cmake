@@ -17,13 +17,13 @@ function(lldb_link_common_libs name targetkind)
   endif()
 endfunction(lldb_link_common_libs)
 
-macro(add_lldb_library name)
+function(add_lldb_library name)
   # only supported parameters to this macro are the optional
   # MODULE;SHARED;STATIC library type and source files
   cmake_parse_arguments(PARAM
     "MODULE;SHARED;STATIC;OBJECT"
     ""
-    ""
+    "DEPENDS"
     ${ARGN})
   llvm_process_sources(srcs ${PARAM_UNPARSED_ARGUMENTS})
 
@@ -49,7 +49,7 @@ macro(add_lldb_library name)
   endif()
 
   #PIC not needed on Win
-  if (NOT MSVC)
+  if (NOT WIN32)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
   endif()
 
@@ -61,14 +61,16 @@ macro(add_lldb_library name)
         llvm_add_library(${name} ${libkind} ${srcs} LINK_LIBS
                                 -Wl,--start-group ${LLDB_USED_LIBS} -Wl,--end-group
                                 -Wl,--start-group ${CLANG_USED_LIBS} -Wl,--end-group
+                                DEPENDS ${PARAM_DEPENDS}
           )
       else()
         llvm_add_library(${name} ${libkind} ${srcs} LINK_LIBS
                                 ${LLDB_USED_LIBS} ${CLANG_USED_LIBS}
+                                DEPENDS ${PARAM_DEPENDS}
           )
       endif()
     else()
-      llvm_add_library(${name} ${libking} ${srcs})
+      llvm_add_library(${name} ${libkind} ${srcs} DEPENDS ${PARAM_DEPENDS})
     endif()
 
     if (NOT LLVM_INSTALL_TOOLCHAIN_ONLY OR ${name} STREQUAL "liblldb")
@@ -78,13 +80,22 @@ macro(add_lldb_library name)
           set(out_dir ${LLDB_FRAMEWORK_INSTALL_DIR})
         endif()
         install(TARGETS ${name}
+          COMPONENT ${name}
           RUNTIME DESTINATION bin
           LIBRARY DESTINATION ${out_dir}
           ARCHIVE DESTINATION ${out_dir})
       else()
         install(TARGETS ${name}
+          COMPONENT ${name}
           LIBRARY DESTINATION lib${LLVM_LIBDIR_SUFFIX}
           ARCHIVE DESTINATION lib${LLVM_LIBDIR_SUFFIX})
+      endif()
+      if (NOT CMAKE_CONFIGURATION_TYPES)
+        add_custom_target(install-${name}
+                          DEPENDS ${name}
+                          COMMAND "${CMAKE_COMMAND}"
+                                  -DCMAKE_INSTALL_COMPONENT=${name}
+                                  -P "${CMAKE_BINARY_DIR}/cmake_install.cmake")
       endif()
     endif()
   endif()
@@ -98,10 +109,10 @@ macro(add_lldb_library name)
   endif()
 
   set_target_properties(${name} PROPERTIES FOLDER "lldb libraries")
-endmacro(add_lldb_library)
+endfunction(add_lldb_library)
 
-macro(add_lldb_executable name)
-  cmake_parse_arguments(ARG "INCLUDE_IN_FRAMEWORK" "" "" ${ARGN})
+function(add_lldb_executable name)
+  cmake_parse_arguments(ARG "INCLUDE_IN_FRAMEWORK;GENERATE_INSTALL" "" "" ${ARGN})
   add_llvm_executable(${name} ${ARG_UNPARSED_ARGUMENTS})
   set_target_properties(${name} PROPERTIES
     FOLDER "lldb executables")
@@ -113,15 +124,45 @@ macro(add_lldb_executable name)
             RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:liblldb>/Resources
             BUILD_WITH_INSTALL_RPATH On
             INSTALL_RPATH "@loader_path/../../../../${_dots}/${LLDB_FRAMEWORK_INSTALL_DIR}")
-
-      add_llvm_tool_symlink(${name} $<TARGET_FILE:${name}> ARG_ALWAYS_GENERATE)
+      # For things inside the framework we don't need functional install targets
+      # because CMake copies the resources and headers from the build directory.
+      # But we still need this target to exist in order to use the
+      # LLVM_DISTRIBUTION_COMPONENTS build option. We also need the
+      # install-liblldb target to depend on this tool, so that it gets put into
+      # the Resources directory before the framework is installed.
+      if(ARG_GENERATE_INSTALL)
+        add_custom_target(install-${name} DEPENDS ${name})
+        add_dependencies(install-liblldb ${name})
+      endif()
     else()
       set_target_properties(${name} PROPERTIES
             BUILD_WITH_INSTALL_RPATH On
             INSTALL_RPATH "@loader_path/../${LLDB_FRAMEWORK_INSTALL_DIR}")
     endif()
   endif()
-endmacro(add_lldb_executable)
+
+  if(ARG_GENERATE_INSTALL AND NOT (ARG_INCLUDE_IN_FRAMEWORK AND LLDB_BUILD_FRAMEWORK ))
+    install(TARGETS ${name}
+          COMPONENT ${name}
+          RUNTIME DESTINATION bin)
+    if (NOT CMAKE_CONFIGURATION_TYPES)
+      add_custom_target(install-${name}
+                        DEPENDS ${name}
+                        COMMAND "${CMAKE_COMMAND}"
+                                -DCMAKE_INSTALL_COMPONENT=${name}
+                                -P "${CMAKE_BINARY_DIR}/cmake_install.cmake")
+    endif()
+  endif()
+
+  if(ARG_INCLUDE_IN_FRAMEWORK AND LLDB_BUILD_FRAMEWORK)
+    add_llvm_tool_symlink(${name} ${name} ALWAYS_GENERATE SKIP_INSTALL
+                            OUTPUT_DIR ${LLVM_RUNTIME_OUTPUT_INTDIR})
+  endif()
+endfunction(add_lldb_executable)
+
+function(add_lldb_tool name)
+  add_lldb_executable(${name} GENERATE_INSTALL ${ARGN})
+endfunction()
 
 # Support appending linker flags to an existing target.
 # This will preserve the existing linker flags on the

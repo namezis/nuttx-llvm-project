@@ -200,10 +200,15 @@ TEST(FileSpecTest, EqualDotsPosixRoot) {
 
 TEST(FileSpecTest, GetNormalizedPath) {
   std::pair<const char *, const char *> posix_tests[] = {
+      {"/foo/.././bar", "/bar"},
+      {"/foo/./../bar", "/bar"},
       {"/foo/../bar", "/bar"},
       {"/foo/./bar", "/foo/bar"},
       {"/foo/..", "/"},
       {"/foo/.", "/foo"},
+      {"/foo//bar", "/foo/bar"},
+      {"/foo//bar/baz", "/foo/bar/baz"},
+      {"/foo//bar/./baz", "/foo/bar/baz"},
       {"/./foo", "/foo"},
       {"/", "/"},
       {"//", "//"},
@@ -254,4 +259,28 @@ TEST(FileSpecTest, GetNormalizedPath) {
                   .GetPath())
         << "Original path: " << test.first;
   }
+}
+
+TEST(FileSpecTest, FormatFileSpec) {
+  auto win = FileSpec::ePathSyntaxWindows;
+
+  FileSpec F;
+  EXPECT_EQ("(empty)", llvm::formatv("{0}", F).str());
+  EXPECT_EQ("(empty)", llvm::formatv("{0:D}", F).str());
+  EXPECT_EQ("(empty)", llvm::formatv("{0:F}", F).str());
+
+  F = FileSpec("C:\\foo\\bar.txt", false, win);
+  EXPECT_EQ("C:\\foo\\bar.txt", llvm::formatv("{0}", F).str());
+  EXPECT_EQ("C:\\foo\\", llvm::formatv("{0:D}", F).str());
+  EXPECT_EQ("bar.txt", llvm::formatv("{0:F}", F).str());
+
+  F = FileSpec("foo\\bar.txt", false, win);
+  EXPECT_EQ("foo\\bar.txt", llvm::formatv("{0}", F).str());
+  EXPECT_EQ("foo\\", llvm::formatv("{0:D}", F).str());
+  EXPECT_EQ("bar.txt", llvm::formatv("{0:F}", F).str());
+
+  F = FileSpec("foo", false, win);
+  EXPECT_EQ("foo", llvm::formatv("{0}", F).str());
+  EXPECT_EQ("foo", llvm::formatv("{0:F}", F).str());
+  EXPECT_EQ("(empty)", llvm::formatv("{0:D}", F).str());
 }

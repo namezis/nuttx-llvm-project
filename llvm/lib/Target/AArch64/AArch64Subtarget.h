@@ -43,6 +43,7 @@ public:
     CortexA73,
     Cyclone,
     ExynosM1,
+    Falkor,
     Kryo,
     Vulcan
   };
@@ -58,6 +59,7 @@ protected:
   bool HasNEON = false;
   bool HasCrypto = false;
   bool HasCRC = false;
+  bool HasLSE = false;
   bool HasRAS = false;
   bool HasPerfMon = false;
   bool HasFullFP16 = false;
@@ -71,14 +73,13 @@ protected:
 
   // StrictAlign - Disallow unaligned memory accesses.
   bool StrictAlign = false;
-  bool MergeNarrowLoads = false;
   bool UseAA = false;
   bool PredictableSelectIsExpensive = false;
   bool BalanceFPOps = false;
   bool CustomAsCheapAsMove = false;
   bool UsePostRAScheduler = false;
   bool Misaligned128StoreIsSlow = false;
-  bool AvoidQuadLdStPairs = false;
+  bool Paired128IsSlow = false;
   bool UseAlternateSExtLoadCVTF32Pattern = false;
   bool HasArithmeticBccFusion = false;
   bool HasArithmeticCbzFusion = false;
@@ -173,20 +174,22 @@ public:
 
   bool requiresStrictAlign() const { return StrictAlign; }
 
+  bool isXRaySupported() const override { return true; }
+
   bool isX18Reserved() const { return ReserveX18; }
   bool hasFPARMv8() const { return HasFPARMv8; }
   bool hasNEON() const { return HasNEON; }
   bool hasCrypto() const { return HasCrypto; }
   bool hasCRC() const { return HasCRC; }
+  bool hasLSE() const { return HasLSE; }
   bool hasRAS() const { return HasRAS; }
-  bool mergeNarrowLoads() const { return MergeNarrowLoads; }
   bool balanceFPOps() const { return BalanceFPOps; }
   bool predictableSelectIsExpensive() const {
     return PredictableSelectIsExpensive;
   }
   bool hasCustomCheapAsMoveHandling() const { return CustomAsCheapAsMove; }
   bool isMisaligned128StoreSlow() const { return Misaligned128StoreIsSlow; }
-  bool avoidQuadLdStPairs() const { return AvoidQuadLdStPairs; }
+  bool isPaired128Slow() const { return Paired128IsSlow; }
   bool useAlternateSExtLoadCVTF32Pattern() const {
     return UseAlternateSExtLoadCVTF32Pattern;
   }

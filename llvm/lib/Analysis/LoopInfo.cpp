@@ -179,9 +179,9 @@ bool Loop::isLCSSAForm(DominatorTree &DT) const {
 }
 
 bool Loop::isRecursivelyLCSSAForm(DominatorTree &DT, const LoopInfo &LI) const {
-  // For each block we check that it doesn't have any uses outside of it's
-  // innermost loop. This process will transitivelly guarntee that current loop 
-  // and all of the nested loops are in the LCSSA form.
+  // For each block we check that it doesn't have any uses outside of its
+  // innermost loop. This process will transitively guarantee that the current
+  // loop and all of the nested loops are in LCSSA form.
   return all_of(this->blocks(), [&](const BasicBlock *BB) {
     return isBlockInLCSSAForm(*LI.getLoopFor(BB), *BB, DT);
   });
@@ -305,23 +305,40 @@ bool Loop::isAnnotatedParallel() const {
 }
 
 DebugLoc Loop::getStartLoc() const {
+  return getLocRange().getStart();
+}
+
+Loop::LocRange Loop::getLocRange() const {
   // If we have a debug location in the loop ID, then use it.
-  if (MDNode *LoopID = getLoopID())
-    for (unsigned i = 1, ie = LoopID->getNumOperands(); i < ie; ++i)
-      if (DILocation *L = dyn_cast<DILocation>(LoopID->getOperand(i)))
-        return DebugLoc(L);
+  if (MDNode *LoopID = getLoopID()) {
+    DebugLoc Start;
+    // We use the first DebugLoc in the header as the start location of the loop
+    // and if there is a second DebugLoc in the header we use it as end location
+    // of the loop.
+    for (unsigned i = 1, ie = LoopID->getNumOperands(); i < ie; ++i) {
+      if (DILocation *L = dyn_cast<DILocation>(LoopID->getOperand(i))) {
+        if (!Start)
+          Start = DebugLoc(L);
+        else
+          return LocRange(Start, DebugLoc(L));
+      }
+    }
+
+    if (Start)
+      return LocRange(Start);
+  }
 
   // Try the pre-header first.
   if (BasicBlock *PHeadBB = getLoopPreheader())
     if (DebugLoc DL = PHeadBB->getTerminator()->getDebugLoc())
-      return DL;
+      return LocRange(DL);
 
   // If we have no pre-header or there are no instructions with debug
   // info in it, try the header.
   if (BasicBlock *HeadBB = getHeader())
-    return HeadBB->getTerminator()->getDebugLoc();
+    return LocRange(HeadBB->getTerminator()->getDebugLoc());
 
-  return DebugLoc();
+  return LocRange();
 }
 
 bool Loop::hasDedicatedExits() const {
@@ -652,7 +669,7 @@ void LoopInfo::markAsRemoved(Loop *Unloop) {
   }
 }
 
-char LoopAnalysis::PassID;
+AnalysisKey LoopAnalysis::Key;
 
 LoopInfo LoopAnalysis::run(Function &F, FunctionAnalysisManager &AM) {
   // FIXME: Currently we create a LoopInfo from scratch for every function.
@@ -672,18 +689,13 @@ PreservedAnalyses LoopPrinterPass::run(Function &F,
   return PreservedAnalyses::all();
 }
 
-PrintLoopPass::PrintLoopPass() : OS(dbgs()) {}
-PrintLoopPass::PrintLoopPass(raw_ostream &OS, const std::string &Banner)
-    : OS(OS), Banner(Banner) {}
-
-PreservedAnalyses PrintLoopPass::run(Loop &L, AnalysisManager<Loop> &) {
+void llvm::printLoop(Loop &L, raw_ostream &OS, const std::string &Banner) {
   OS << Banner;
   for (auto *Block : L.blocks())
     if (Block)
       Block->print(OS);
     else
       OS << "Printing <null> block";
-  return PreservedAnalyses::all();
 }
 
 //===----------------------------------------------------------------------===//

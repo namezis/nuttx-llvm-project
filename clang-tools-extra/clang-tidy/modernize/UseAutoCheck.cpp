@@ -9,8 +9,8 @@
 
 #include "UseAutoCheck.h"
 #include "clang/AST/ASTContext.h"
-#include "clang/ASTMatchers/ASTMatchers.h"
 #include "clang/ASTMatchers/ASTMatchFinder.h"
+#include "clang/ASTMatchers/ASTMatchers.h"
 
 using namespace clang;
 using namespace clang::ast_matchers;
@@ -24,6 +24,7 @@ namespace {
 const char IteratorDeclStmtId[] = "iterator_decl";
 const char DeclWithNewId[] = "decl_new";
 const char DeclWithCastId[] = "decl_cast";
+const char DeclWithTemplateCastId[] = "decl_template";
 
 /// \brief Matches variable declarations that have explicit initializers that
 /// are not initializer lists.
@@ -114,20 +115,19 @@ AST_MATCHER(NamedDecl, hasStdIteratorName) {
 /// recordDecl(hasStdContainerName()) matches \c vector and \c forward_list
 /// but not \c my_vec.
 AST_MATCHER(NamedDecl, hasStdContainerName) {
-  static const char *const ContainerNames[] = {"array",         "deque",
-                                               "forward_list",  "list",
-                                               "vector",
+  static const char *const ContainerNames[] = {
+      "array",         "deque",
+      "forward_list",  "list",
+      "vector",
 
-                                               "map",           "multimap",
-                                               "set",           "multiset",
+      "map",           "multimap",
+      "set",           "multiset",
 
-                                               "unordered_map",
-                                               "unordered_multimap",
-                                               "unordered_set",
-                                               "unordered_multiset",
+      "unordered_map", "unordered_multimap",
+      "unordered_set", "unordered_multiset",
 
-                                               "queue",         "priority_queue",
-                                               "stack"};
+      "queue",         "priority_queue",
+      "stack"};
 
   for (const char *Name : ContainerNames) {
     if (hasName(Name).matches(Node, Finder, Builder))
@@ -168,6 +168,14 @@ AST_MATCHER(Decl, isFromStdNamespace) {
   const IdentifierInfo *Info = cast<NamespaceDecl>(D)->getIdentifier();
 
   return (Info && Info->isStr("std"));
+}
+
+/// Matches declaration reference or member expressions with explicit template
+/// arguments.
+AST_POLYMORPHIC_MATCHER(hasExplicitTemplateArgs,
+                        AST_POLYMORPHIC_SUPPORTED_TYPES(DeclRefExpr,
+                                                        MemberExpr)) {
+  return Node.hasExplicitTemplateArgs();
 }
 
 /// \brief Returns a DeclarationMatcher that matches standard iterators nested
@@ -241,18 +249,38 @@ StatementMatcher makeDeclWithCastMatcher() {
       .bind(DeclWithCastId);
 }
 
+StatementMatcher makeDeclWithTemplateCastMatcher() {
+  auto ST =
+      substTemplateTypeParmType(hasReplacementType(equalsBoundNode("arg")));
+
+  auto ExplicitCall =
+      anyOf(has(memberExpr(hasExplicitTemplateArgs())),
+            has(ignoringImpCasts(declRefExpr(hasExplicitTemplateArgs()))));
+
+  auto TemplateArg =
+      hasTemplateArgument(0, refersToType(qualType().bind("arg")));
+
+  auto TemplateCall = callExpr(
+      ExplicitCall,
+      callee(functionDecl(TemplateArg,
+                          returns(anyOf(ST, pointsTo(ST), references(ST))))));
+
+  return declStmt(unless(has(varDecl(
+                      unless(hasInitializer(ignoringImplicit(TemplateCall)))))))
+      .bind(DeclWithTemplateCastId);
+}
+
 StatementMatcher makeCombinedMatcher() {
   return declStmt(
       // At least one varDecl should be a child of the declStmt to ensure
       // it's a declaration list and avoid matching other declarations,
       // e.g. using directives.
-      has(varDecl()),
+      has(varDecl(unless(isImplicit()))),
       // Skip declarations that are already using auto.
       unless(has(varDecl(anyOf(hasType(autoType()),
-                               hasType(pointerType(pointee(autoType()))),
-                               hasType(referenceType(pointee(autoType()))))))),
+                               hasType(qualType(hasDescendant(autoType()))))))),
       anyOf(makeIteratorDeclMatcher(), makeDeclWithNewMatcher(),
-            makeDeclWithCastMatcher()));
+            makeDeclWithCastMatcher(), makeDeclWithTemplateCastMatcher()));
 }
 
 } // namespace
@@ -390,6 +418,8 @@ void UseAutoCheck::replaceExpr(const DeclStmt *D, ASTContext *Context,
 
   // Space after 'auto' to handle cases where the '*' in the pointer type is
   // next to the identifier. This avoids changing 'int *p' into 'autop'.
+  // FIXME: This doesn't work for function pointers because the variable name
+  // is inside the type.
   Diag << FixItHint::CreateReplacement(Range, RemoveStars ? "auto " : "auto")
        << StarRemovals;
 }
@@ -412,6 +442,17 @@ void UseAutoCheck::check(const MatchFinder::MatchResult &Result) {
         },
         "use auto when initializing with a cast to avoid duplicating the type "
         "name");
+  } else if (const auto *Decl =
+                 Result.Nodes.getNodeAs<DeclStmt>(DeclWithTemplateCastId)) {
+    replaceExpr(
+        Decl, Result.Context,
+        [](const Expr *Expr) {
+          return cast<CallExpr>(Expr->IgnoreImplicit())
+              ->getDirectCallee()
+              ->getReturnType();
+        },
+        "use auto when initializing with a template cast to avoid duplicating "
+        "the type name");
   } else {
     llvm_unreachable("Bad Callback. No node provided.");
   }

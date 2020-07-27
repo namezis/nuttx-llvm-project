@@ -590,10 +590,13 @@ def S_GETREG_B32 : SOPK_Pseudo <
 >;
 }
 
+let hasSideEffects = 1 in {
+
 def S_SETREG_B32 : SOPK_Pseudo <
   "s_setreg_b32",
   (outs), (ins SReg_32:$sdst, hwreg:$simm16),
-  "$simm16, $sdst"
+  "$simm16, $sdst",
+  [(AMDGPUsetreg i32:$sdst, (i16 timm:$simm16))]
 >;
 
 // FIXME: Not on SI?
@@ -607,6 +610,7 @@ def S_SETREG_IMM32_B32 : SOPK_Pseudo <
   let has_sdst = 0;
 }
 
+} // End hasSideEffects = 1
 
 //===----------------------------------------------------------------------===//
 // SOPC Instructions
@@ -824,9 +828,12 @@ let Uses = [EXEC, M0] in {
 def S_SENDMSG : SOPP <0x00000010, (ins SendMsgImm:$simm16), "s_sendmsg $simm16",
   [(AMDGPUsendmsg (i32 imm:$simm16))]
 >;
+
+def S_SENDMSGHALT : SOPP <0x00000011, (ins SendMsgImm:$simm16), "s_sendmsghalt $simm16",
+  [(AMDGPUsendmsghalt (i32 imm:$simm16))]
+>;
 } // End Uses = [EXEC, M0]
 
-def S_SENDMSGHALT : SOPP <0x00000011, (ins SendMsgImm:$simm16), "s_sendmsghalt $simm16">;
 def S_TRAP : SOPP <0x00000012, (ins i16imm:$simm16), "s_trap $simm16">;
 def S_ICACHE_INV : SOPP <0x00000013, (ins), "s_icache_inv"> {
   let simm16 = 0;
@@ -879,13 +886,25 @@ def : Pat <
   (i64 (ctpop i64:$src)),
     (i64 (REG_SEQUENCE SReg_64,
      (i32 (COPY_TO_REGCLASS (S_BCNT1_I32_B64 $src), SReg_32)), sub0,
-     (S_MOV_B32 0), sub1))
+     (S_MOV_B32 (i32 0)), sub1))
 >;
 
 def : Pat <
   (i32 (smax i32:$x, (i32 (ineg i32:$x)))),
   (S_ABS_I32 $x)
 >;
+
+def : Pat <
+  (i16 imm:$imm),
+  (S_MOV_B32 imm:$imm)
+>;
+
+// Same as a 32-bit inreg
+def : Pat<
+  (i32 (sext i16:$src)),
+  (S_SEXT_I32_I16 $src)
+>;
+
 
 //===----------------------------------------------------------------------===//
 // SOP2 Patterns
@@ -897,6 +916,29 @@ def : Pat <
   (i32 (addc i32:$src0, i32:$src1)),
   (S_ADD_U32 $src0, $src1)
 >;
+
+// FIXME: We need to use COPY_TO_REGCLASS to work-around the fact that
+// REG_SEQUENCE patterns don't support instructions with multiple
+// outputs.
+def : Pat<
+  (i64 (zext i16:$src)),
+    (REG_SEQUENCE SReg_64,
+      (i32 (COPY_TO_REGCLASS (S_AND_B32 $src, (S_MOV_B32 (i32 0xffff))), SGPR_32)), sub0,
+      (S_MOV_B32 (i32 0)), sub1)
+>;
+
+def : Pat <
+  (i64 (sext i16:$src)),
+    (REG_SEQUENCE SReg_64, (i32 (S_SEXT_I32_I16 $src)), sub0,
+    (i32 (COPY_TO_REGCLASS (S_ASHR_I32 (i32 (S_SEXT_I32_I16 $src)), (S_MOV_B32 (i32 31))), SGPR_32)), sub1)
+>;
+
+def : Pat<
+  (i32 (zext i16:$src)),
+  (S_AND_B32 (S_MOV_B32 (i32 0xffff)), $src)
+>;
+
+
 
 //===----------------------------------------------------------------------===//
 // SOPP Patterns

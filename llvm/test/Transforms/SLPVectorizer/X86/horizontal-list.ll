@@ -8,7 +8,8 @@
 
 define float @baz() {
 ; CHECK-LABEL: @baz(
-; CHECK:         [[TMP0:%.*]] = load i32, i32* @n, align 4
+; CHECK-NEXT:  entry:
+; CHECK-NEXT:    [[TMP0:%.*]] = load i32, i32* @n, align 4
 ; CHECK-NEXT:    [[MUL:%.*]] = mul nsw i32 [[TMP0]], 3
 ; CHECK-NEXT:    [[CONV:%.*]] = sitofp i32 [[MUL]] to float
 ; CHECK-NEXT:    [[TMP1:%.*]] = load float, float* getelementptr inbounds ([20 x float], [20 x float]* @arr, i64 0, i64 0), align 16
@@ -65,7 +66,8 @@ entry:
 
 define float @bazz() {
 ; CHECK-LABEL: @bazz(
-; CHECK:         [[TMP0:%.*]] = load i32, i32* @n, align 4
+; CHECK-NEXT:  entry:
+; CHECK-NEXT:    [[TMP0:%.*]] = load i32, i32* @n, align 4
 ; CHECK-NEXT:    [[MUL:%.*]] = mul nsw i32 [[TMP0]], 3
 ; CHECK-NEXT:    [[CONV:%.*]] = sitofp i32 [[MUL]] to float
 ; CHECK-NEXT:    [[TMP1:%.*]] = load float, float* getelementptr inbounds ([20 x float], [20 x float]* @arr, i64 0, i64 0), align 16
@@ -150,7 +152,8 @@ entry:
 
 define float @bazzz() {
 ; CHECK-LABEL: @bazzz(
-; CHECK:         [[TMP0:%.*]] = load i32, i32* @n, align 4
+; CHECK-NEXT:  entry:
+; CHECK-NEXT:    [[TMP0:%.*]] = load i32, i32* @n, align 4
 ; CHECK-NEXT:    [[CONV:%.*]] = sitofp i32 [[TMP0]] to float
 ; CHECK-NEXT:    [[TMP1:%.*]] = load float, float* getelementptr inbounds ([20 x float], [20 x float]* @arr, i64 0, i64 0), align 16
 ; CHECK-NEXT:    [[TMP2:%.*]] = load float, float* getelementptr inbounds ([20 x float], [20 x float]* @arr1, i64 0, i64 0), align 16
@@ -196,7 +199,8 @@ entry:
 
 define i32 @foo() {
 ; CHECK-LABEL: @foo(
-; CHECK:         [[TMP0:%.*]] = load i32, i32* @n, align 4
+; CHECK-NEXT:  entry:
+; CHECK-NEXT:    [[TMP0:%.*]] = load i32, i32* @n, align 4
 ; CHECK-NEXT:    [[CONV:%.*]] = sitofp i32 [[TMP0]] to float
 ; CHECK-NEXT:    [[TMP1:%.*]] = load float, float* getelementptr inbounds ([20 x float], [20 x float]* @arr, i64 0, i64 0), align 16
 ; CHECK-NEXT:    [[TMP2:%.*]] = load float, float* getelementptr inbounds ([20 x float], [20 x float]* @arr1, i64 0, i64 0), align 16

@@ -27,11 +27,6 @@ if(TARGET lldb-mi)
   list(APPEND LLDB_TEST_DEPS lldb-mi)
 endif()
 
-# This target will only exist if the user is using a CMake older than 3.7
-if(TARGET lldb_header_symlink)
-  list(APPEND LLDB_TEST_DEPS lldb_header_symlink)
-endif()
-
 if ("${LLDB_TEST_COMPILER}" STREQUAL "")
     string(REGEX REPLACE ".*ccache\ +" "" LLDB_TEST_COMPILER ${CMAKE_C_COMPILER} ${CMAKE_C_COMPILER_ARG1})
 endif()
@@ -52,6 +47,10 @@ set(LLDB_TEST_ARCH
 # TODO: remove the replace lines and the FORCE parameter in a few days once the
 # change has made its way through bots to clean up their CMake caches.
 string(REPLACE "-C;${LLDB_TEST_COMPILER}" "" LLDB_TEST_USER_ARGS_New "${LLDB_TEST_USER_ARGS}")
+
+if(LLDB_TEST_CLANG)
+  set(LLDB_TEST_COMPILER $<TARGET_FILE:clang>)
+endif()
 
 # Users can override LLDB_TEST_USER_ARGS to specify arbitrary arguments to pass to the script
 set(LLDB_TEST_USER_ARGS

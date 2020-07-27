@@ -22,6 +22,8 @@
 #include "lldb/Host/PosixApi.h"
 #include "lldb/lldb-private.h"
 
+#include "llvm/Support/FormatVariadic.h"
+
 namespace lldb_private {
 
 //----------------------------------------------------------------------
@@ -745,9 +747,9 @@ protected:
   //------------------------------------------------------------------
   // Member variables
   //------------------------------------------------------------------
-  ConstString m_directory;    ///< The uniqued directory path
-  ConstString m_filename;     ///< The uniqued filename path
-  mutable bool m_is_resolved; ///< True if this path has been resolved.
+  ConstString m_directory;            ///< The uniqued directory path
+  ConstString m_filename;             ///< The uniqued filename path
+  mutable bool m_is_resolved = false; ///< True if this path has been resolved.
   PathSyntax
       m_syntax; ///< The syntax that this path uses (e.g. Windows / Posix)
 };
@@ -758,5 +760,31 @@ protected:
 Stream &operator<<(Stream &s, const FileSpec &f);
 
 } // namespace lldb_private
+
+namespace llvm {
+
+/// Implementation of format_provider<T> for FileSpec.
+///
+/// The options string of a FileSpec has the grammar:
+///
+///   file_spec_options   :: (empty) | F | D
+///
+///   =======================================================
+///   |  style  |     Meaning          |      Example       |
+///   -------------------------------------------------------
+///   |         |                      |  Input   |  Output |
+///   =======================================================
+///   |    F    | Only print filename  | /foo/bar |   bar   |
+///   |    D    | Only print directory | /foo/bar |  /foo/  |
+///   | (empty) | Print file and dir   |          |         |
+///   =======================================================
+///
+/// Any other value is considered an invalid format string.
+///
+template <> struct format_provider<lldb_private::FileSpec> {
+  static void format(const lldb_private::FileSpec &F, llvm::raw_ostream &Stream,
+                     StringRef Style);
+};
+}
 
 #endif // liblldb_FileSpec_h_

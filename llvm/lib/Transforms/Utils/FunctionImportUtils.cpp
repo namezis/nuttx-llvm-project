@@ -56,27 +56,48 @@ bool FunctionImportGlobalProcessing::shouldPromoteLocalToGlobal(
   if (!isPerformingImport() && !isModuleExporting())
     return false;
 
-  // Local const variables never need to be promoted unless they are address
-  // taken. The imported uses can simply use the clone created in this module.
-  // For now we are conservative in determining which variables are not
-  // address taken by checking the unnamed addr flag. To be more aggressive,
-  // the address taken information must be checked earlier during parsing
-  // of the module and recorded in the summary index for use when importing
-  // from that module.
-  auto *GVar = dyn_cast<GlobalVariable>(SGV);
-  if (GVar && GVar->isConstant() && GVar->hasGlobalUnnamedAddr())
-    return false;
+  if (isPerformingImport()) {
+    assert((!GlobalsToImport->count(SGV) || !isNonRenamableLocal(*SGV)) &&
+           "Attempting to promote non-renamable local");
+    // We don't know for sure yet if we are importing this value (as either
+    // a reference or a def), since we are simply walking all values in the
+    // module. But by necessity if we end up importing it and it is local,
+    // it must be promoted, so unconditionally promote all values in the
+    // importing module.
+    return true;
+  }
 
-  auto *Summary = ImportIndex.getGlobalValueSummary(SGV->getGUID());
-  assert(Summary && "Missing summary for global value");
-  if (Summary->noRename())
-    return false;
+  // When exporting, consult the index. We can have more than one local
+  // with the same GUID, in the case of same-named locals in different but
+  // same-named source files that were compiled in their respective directories
+  // (so the source file name and resulting GUID is the same). Find the one
+  // in this module.
+  auto Summary = ImportIndex.findSummaryInModule(
+      SGV->getGUID(), SGV->getParent()->getModuleIdentifier());
+  assert(Summary && "Missing summary for global value when exporting");
+  auto Linkage = Summary->linkage();
+  if (!GlobalValue::isLocalLinkage(Linkage)) {
+    assert(!isNonRenamableLocal(*SGV) &&
+           "Attempting to promote non-renamable local");
+    return true;
+  }
 
-  // Eventually we only need to promote functions in the exporting module that
-  // are referenced by a potentially exported function (i.e. one that is in the
-  // summary index).
-  return true;
+  return false;
 }
+
+#ifndef NDEBUG
+bool FunctionImportGlobalProcessing::isNonRenamableLocal(
+    const GlobalValue &GV) const {
+  if (!GV.hasLocalLinkage())
+    return false;
+  // This needs to stay in sync with the logic in buildModuleSummaryIndex.
+  if (GV.hasSection())
+    return true;
+  if (Used.count(const_cast<GlobalValue *>(&GV)))
+    return true;
+  return false;
+}
+#endif
 
 std::string FunctionImportGlobalProcessing::getName(const GlobalValue *SGV,
                                                     bool DoPromote) {

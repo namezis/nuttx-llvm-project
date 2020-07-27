@@ -69,6 +69,10 @@ void AArch64Subtarget::initializeProperties() {
     PrefFunctionAlignment = 4;
     PrefLoopAlignment = 3;
     break;
+  case Falkor:
+    MaxInterleaveFactor = 4;
+    VectorInsertExtractBaseCost = 2;
+    break;
   case Kryo:
     MaxInterleaveFactor = 4;
     VectorInsertExtractBaseCost = 2;

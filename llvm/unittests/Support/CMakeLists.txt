@@ -14,12 +14,15 @@ add_llvm_unittest(SupportTests
   CompressionTest.cpp
   ConvertUTFTest.cpp
   DataExtractorTest.cpp
+  DebugTest.cpp
   DwarfTest.cpp
   EndianStreamTest.cpp
   EndianTest.cpp
-  ErrorTest.cpp
   ErrorOrTest.cpp
+  ErrorTest.cpp
   FileOutputBufferTest.cpp
+  FormatVariadicTest.cpp
+  GlobPatternTest.cpp
   Host.cpp
   LEB128Test.cpp
   LineIteratorTest.cpp
@@ -40,14 +43,15 @@ add_llvm_unittest(SupportTests
   SpecialCaseListTest.cpp
   StringPool.cpp
   SwapByteOrderTest.cpp
+  TarWriterTest.cpp
   TargetParserTest.cpp
-  Threading.cpp
   ThreadLocalTest.cpp
   ThreadPool.cpp
+  Threading.cpp
   TimerTest.cpp
-  TimeValueTest.cpp
   TypeNameTest.cpp
   TrailingObjectsTest.cpp
+  TrigramIndexTest.cpp
   UnicodeTest.cpp
   YAMLIOTest.cpp
   YAMLParserTest.cpp
