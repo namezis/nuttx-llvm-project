@@ -46,6 +46,7 @@ CXXSRCS += locale.cxx
 # Exception handling logic
 
 CXXSRCS += exception.cxx stdexcept.cxx
+CXXSRCS += libxx_cxapurevirtual.cxx
 
 # libsupc++ replacement
 
